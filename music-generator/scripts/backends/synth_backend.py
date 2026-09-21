@@ -51,8 +51,13 @@ class SynthBackend(BaseBackend):
         key: str,
         length: int,
         seed: int | None = None,
+        output_path: str | None = None,
     ) -> dict:
-        """Generate audio using the deterministic synth engine."""
+        """Generate audio using the deterministic synth engine.
+
+        If output_path is given, render directly there (used by worker for
+        atomic temp→final rename). Otherwise use the default output dir.
+        """
         # Validate seed — the API layer returns 400 for out-of-range seeds,
         # so reaching here with an invalid seed is a programming error
         if seed is not None and (seed < 0 or seed > 2**32 - 1):
@@ -102,10 +107,14 @@ class SynthBackend(BaseBackend):
         # Add drums
         engine.add_drums(bars=bars)
 
-        # Render
-        output_dir = Path(OUTPUT_DIR)
-        output_dir.mkdir(exist_ok=True)
-        wav_path = output_dir / f"{job_id}.wav"
+        # Render: use output_path if given (worker temp file), else default
+        if output_path:
+            wav_path = Path(output_path)
+            wav_path.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            output_dir = Path(OUTPUT_DIR)
+            output_dir.mkdir(exist_ok=True)
+            wav_path = output_dir / f"{job_id}.wav"
 
         integrity = engine.render(output_path=wav_path)
 

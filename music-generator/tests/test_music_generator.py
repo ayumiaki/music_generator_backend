@@ -331,6 +331,8 @@ class TestRegressionJobTimeoutUsed:
         from worker import JobTimeoutError, _timeout_handler, process_job
 
         class SlowBackend:
+            output_dir = "/tmp"
+
             def generate(self, **kwargs):
                 time.sleep(5)
                 return {"status": "success", "output_file": "/tmp/slow.wav"}

@@ -332,10 +332,14 @@ class FileQueue(BaseQueue):
         Scans all job files (not just queue list) since claimed jobs
         are removed from the pending list.
 
-        Also cleans up orphaned .tmp.*.wav files from dead workers
-        (render-temp files left behind by a worker that died mid-render).
+        Also cleans up orphaned .tmp.*.wav files belonging to the specific
+        (worker_id, job_id) pairs being recovered — NOT a nuclear cleanup
+        that would delete temp files from healthy concurrent workers.
         """
+        from render_io import temp_path as _tmp
         recovered = []
+        # Collect (dead_worker_id, job_id) pairs for targeted cleanup
+        dead_worker_jobs: list[tuple[str, str]] = []
         with self._locked() as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             try:
@@ -350,27 +354,35 @@ class FileQueue(BaseQueue):
                         if item.status == "processing":
                             item.status = "pending"
                             item.processing_at = None
-                            # Track the dead worker's id so we can clean its temp files
+                            # Track the dead worker + job for targeted cleanup
                             dead_worker = item.worker_id
                             item.worker_id = None
                             self._atomic_write(job_file, json.dumps(item.to_dict(), indent=2))
                             if job_id not in ids:
                                 ids.append(job_id)
                             recovered.append(item)
+                            if dead_worker:
+                                dead_worker_jobs.append((dead_worker, job_id))
                     except (json.JSONDecodeError, KeyError):
                         pass
                 self._write_queue_ids(ids)
             finally:
                 fcntl.flock(lock, fcntl.LOCK_UN)
-        # Clean up orphaned temp files from recovered workers
-        from config import OUTPUT_DIR as _out
-        cleanup_dir = Path(output_dir) if output_dir else _out
-        from render_io import cleanup_orphan_temp as _cleanup
-        removed = _cleanup(cleanup_dir, known_worker_ids=None)
-        if removed:
-            # Import here to avoid hard dependency at module level
-            import sys
-            print(f"Cleaned {len(removed)} orphaned temp file(s) from dead worker(s)", file=sys.stderr)
+        # Targeted cleanup: only delete temp files for recovered (worker, job) pairs
+        if dead_worker_jobs and output_dir:
+            cleanup_dir = Path(output_dir)
+            removed = []
+            for dead_worker, job_id in dead_worker_jobs:
+                tmp = _tmp(cleanup_dir, dead_worker, job_id)
+                try:
+                    if tmp.exists():
+                        tmp.unlink()
+                        removed.append(tmp)
+                except OSError:
+                    pass
+            if removed:
+                import sys
+                print(f"Cleaned {len(removed)} orphaned temp file(s) from dead worker(s)", file=sys.stderr)
         return recovered
 
     def get_item(self, job_id: str) -> Optional[QueueItem]:
@@ -687,8 +699,14 @@ class RedisQueue(BaseQueue):
 
         Routes recovered entries through _claim_entry() so that _pending_acks
         is populated and completion will ACK the stream entry.
+
+        If output_dir is given, cleans up orphaned .tmp.*.wav files belonging
+        to the specific (worker_id, job_id) pairs being recovered — NOT a
+        nuclear cleanup that would delete temp files from healthy workers.
         """
         recovered = []
+        # Collect (dead_worker_id, job_id) pairs for targeted cleanup
+        dead_worker_jobs: list[tuple[str, str]] = []
         try:
             # Get pending entries info
             pending = self.client.xpending_range(
@@ -697,6 +715,16 @@ class RedisQueue(BaseQueue):
             )
             if not pending:
                 return recovered
+
+            # Remember the original owner of each pending entry
+            entry_owners: Dict[str, str] = {}  # job_id -> consumer (worker_id)
+            for entry in pending:
+                job_id = entry.get("message", {}).get("job_id")
+                consumer = entry.get("consumer")
+                if isinstance(consumer, bytes):
+                    consumer = consumer.decode()
+                if job_id and consumer:
+                    entry_owners[job_id] = consumer
 
             # Group by consumer and auto-claim stale ones
             consumers = set()
@@ -722,6 +750,9 @@ class RedisQueue(BaseQueue):
                             job_id = fields.get(b"job_id") or fields.get("job_id")
                             if isinstance(job_id, bytes):
                                 job_id = job_id.decode()
+                            # Track dead worker for targeted cleanup
+                            dead_worker = entry_owners.get(job_id, consumer)
+                            dead_worker_jobs.append((dead_worker, job_id))
                             # Route through _claim_entry for ACK tracking
                             item = self._claim_entry(job_id, entry_id, "recovery-worker")
                             if item:
@@ -730,6 +761,22 @@ class RedisQueue(BaseQueue):
                     continue
         except redis_lib.exceptions.ResponseError:
             pass
+        # Targeted cleanup: only delete temp files for recovered (worker, job) pairs
+        if dead_worker_jobs and output_dir:
+            from render_io import temp_path as _tmp
+            cleanup_dir = Path(output_dir)
+            removed = []
+            for dead_worker, job_id in dead_worker_jobs:
+                tmp = _tmp(cleanup_dir, dead_worker, job_id)
+                try:
+                    if tmp.exists():
+                        tmp.unlink()
+                        removed.append(tmp)
+                except OSError:
+                    pass
+            if removed:
+                import sys
+                print(f"Cleaned {len(removed)} orphaned temp file(s) from dead worker(s)", file=sys.stderr)
         return recovered
 
     def list_items(self, limit: int = 100) -> List[QueueItem]:

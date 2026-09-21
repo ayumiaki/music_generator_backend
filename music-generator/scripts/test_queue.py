@@ -640,6 +640,45 @@ class TestRedisRecoveryIntegration(unittest.TestCase):
         self.assertEqual(recovered_ids, set(job_ids))
 
     @mock.patch("job_queue.WORKER_TIMEOUT", 1)
+    def test_redis_recovery_cleans_old_worker_temp(self):
+        """After Redis recovery, the dead worker's temp file is cleaned up."""
+        from render_io import temp_path as _tmp
+
+        output_dir = Path(tempfile.mkdtemp())
+        job_id = self.queue.enqueue(
+            QueueItem(prompt="cleanup test", mood="calm", tempo=120,
+                      key="C", length=1, seed=5)
+        )
+        self.queue.dequeue(worker_id="dead-producer", block_ms=100)
+
+        # Simulate dead worker's partial temp file
+        dead_tmp = _tmp(output_dir, "dead-producer", job_id)
+        dead_tmp.write_bytes(b"PARTIAL_NOT_WAV")
+        self.assertTrue(dead_tmp.exists())
+
+        # Also place a rogue temp file (not belonging to this job)
+        rogue = output_dir / ".tmp.rogue.other-job.wav"
+        rogue.write_bytes(b"ROGUE")
+        self.assertTrue(rogue.exists())
+
+        time.sleep(2.1)
+
+        # Recover — should clean up dead-producer's temp for this job
+        recovered = self.queue.recover(output_dir=str(output_dir))
+        self.assertEqual(len(recovered), 1)
+
+        # Dead worker's temp for recovered job must be gone
+        self.assertFalse(
+            dead_tmp.exists(),
+            f"Dead worker's temp must be cleaned after recovery: {dead_tmp}"
+        )
+        # Rogue temp must survive
+        self.assertTrue(
+            rogue.exists(),
+            f"Rogue temp must survive recovery: {rogue}"
+        )
+
+    @mock.patch("job_queue.WORKER_TIMEOUT", 1)
     def test_redis_recovery_with_mock_backend_produces_valid_artifact(self):
         """After recovery, process_job produces a valid WAV artifact on disk."""
         from backends.mock_backend import MockBackend
@@ -1104,6 +1143,96 @@ class TestFileQueueRecoveryIntegration(QueueTestSuite):
         self.assertEqual(tmp_count, 0)
         self.assertTrue(wav_valid)
         self.assertEqual(final_depth, 0)
+
+
+    def test_recovery_cleanup_is_targeted_not_nuclear(self):
+        """Recovery cleanup only deletes temp files for recovered (worker, job) pairs.
+
+        Scenario:
+        - Dead worker D owned job_D (stuck in processing, temp file exists)
+        - A rogue temp file exists in output_dir (not belonging to any job)
+        - Recovery runs: job_D reclaimed, rogue temp file MUST survive
+        This proves cleanup is targeted to recovered pairs, not a nuclear delete-all.
+        """
+        from render_io import temp_path as _tmp
+
+        tmpdir = self._make_shared_queue()
+        output_dir = os.path.join(tmpdir, "output")
+        os.makedirs(output_dir, exist_ok=True)
+        q_a = FileQueue(queue_dir=tmpdir)
+        q_b = FileQueue(queue_dir=tmpdir)
+
+        # Enqueue job_D
+        job_D = q_a.enqueue(self._make_item(seed=1))
+        q_a.dequeue(worker_id="worker-D")
+
+        # Worker D's temp file
+        d_tmp = _tmp(output_dir, "worker-D", job_D)
+        d_tmp.write_bytes(b"D_PARTIAL")
+        self.assertTrue(d_tmp.exists())
+
+        # Rogue temp file (not belonging to any job)
+        rogue = Path(output_dir) / ".tmp.rogue-worker.some-orphan-job.wav"
+        rogue.write_bytes(b"ROGUE")
+        self.assertTrue(rogue.exists())
+
+        # Recover
+        recovered = q_b.recover(output_dir=output_dir)
+        self.assertEqual(len(recovered), 1)
+        self.assertEqual(recovered[0].job_id, job_D)
+
+        # Worker D's temp file must be gone (cleaned up)
+        self.assertFalse(
+            d_tmp.exists(),
+            f"Dead worker D's temp must be cleaned: {d_tmp}"
+        )
+
+        # Rogue temp file must SURVIVE (not nuclear cleanup)
+        self.assertTrue(
+            rogue.exists(),
+            f"Rogue temp file must NOT be deleted by recovery: {rogue}"
+        )
+
+    def test_synth_backend_process_job_end_to_end(self):
+        """SynthBackend + process_job: real synth render, valid WAV, no temp left."""
+        from backends.synth_backend import SynthBackend
+        from worker import process_job
+        from render_io import temp_path as _tmp
+
+        tmpdir = self._make_shared_queue()
+        output_dir = os.path.join(tmpdir, "output")
+        os.makedirs(output_dir, exist_ok=True)
+        q = FileQueue(queue_dir=tmpdir)
+        backend = SynthBackend()
+
+        # Enqueue a short job (1 second)
+        item = self._make_item(seed=7)
+        item.length = 1
+        job_id = q.enqueue(item)
+        got = q.dequeue(worker_id="synth-worker")
+        assert got is not None
+
+        # Process through real synth backend
+        process_job(q, backend, got, worker_id="synth-worker")
+
+        # Verify completion
+        final = q.get_item(job_id)
+        self.assertEqual(final.status, "completed")
+        self.assertIsNotNone(final.completed_at)
+
+        # Verify valid WAV artifact
+        output_file = final.result.get("output_file")
+        self.assertIsNotNone(output_file)
+        self.assertTrue(os.path.exists(output_file))
+        self.assertGreater(os.path.getsize(output_file), 0)
+        self.assertTrue(_validate_wav_header(output_file))
+
+        # Verify no temp file left
+        tmp = _tmp(output_dir, "synth-worker", job_id)
+        self.assertFalse(tmp.exists())
+
+        # Verify file is at final path
+        self.assertEqual(Path(output_file).name, f"{job_id}.wav")
 
 
 def _validate_wav_header(path: str) -> bool:
