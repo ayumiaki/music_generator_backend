@@ -606,6 +606,9 @@ class RedisQueue(BaseQueue):
             item.worker_id = worker_id
         if result is not None:
             item.result = result
+        # Persist render_duration_ms from the result dict into the item
+        if result and "render_duration_ms" in result:
+            item.render_duration_ms = result["render_duration_ms"]
         # Synth/mock backends return "output_file", not "artifact_path"
         output_path = item.result.get("output_file") or item.result.get("artifact_path")
         if output_path:
@@ -739,27 +742,36 @@ class RedisQueue(BaseQueue):
     def depth(self) -> Dict[str, int]:
         """Return queue depth metrics.
 
-        Uses consumer group lag (undelivered entries) + pending count
+        Uses consumer-group lag (undelivered entries) + pending count
         rather than XLEN (which includes acknowledged entries).
         """
+        lag = 0
         pending = 0
-        processing = 0
 
         try:
-            # Get pending entries (delivered but not yet ACKed)
+            # Lag = entries in the stream never delivered to any consumer
+            groups = self.client.xinfo_groups(self.stream_key)
+            for g in groups:
+                if g.get("name", b"").decode() == self.group_name:
+                    lag = g.get("lag", 0)
+                    break
+        except redis_lib.exceptions.ResponseError:
+            pass
+
+        try:
+            # Pending = delivered to a consumer but not yet ACKed
             pending_info = self.client.xpending(self.stream_key, self.group_name)
             pending = pending_info.get("pending", 0)
         except redis_lib.exceptions.ResponseError:
             pass
 
-        # Processing = pending entries currently claimed by a worker
-        # (In Redis Streams, "pending" = delivered to a consumer but not ACKed)
+        # Processing = entries currently claimed by a worker (pending)
         processing = pending
 
         return {
-            "pending": pending,
+            "pending": lag + pending,  # undelivered + delivered-but-unacked
             "processing": processing,
-            "total_active": pending,
+            "total_active": lag + pending,
         }
 
     def get_metrics(self) -> Dict[str, Any]:

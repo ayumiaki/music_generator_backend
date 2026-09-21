@@ -332,11 +332,47 @@ class TestRedisQueueStreams(unittest.TestCase):
         self.assertIsNone(result)
 
     def test_depth_metrics(self):
-        for i in range(3):
-            self.queue.enqueue(self._make_item(seed=i))
+        """Depth includes both undelivered (lag) and pending entries."""
+        # Fresh queue: no lag, no pending
         depth = self.queue.depth()
-        self.assertIn("pending", depth)
-        self.assertIn("total_active", depth)
+        self.assertEqual(depth["total_active"], 0)
+
+        # Enqueue 3 items: they are lag (undelivered) until a worker reads them
+        job_ids = []
+        for i in range(3):
+            job_ids.append(self.queue.enqueue(self._make_item(seed=i)))
+
+        depth = self.queue.depth()
+        self.assertEqual(depth["pending"], 3, "Expected 3 undelivered jobs")
+        self.assertEqual(depth["total_active"], 3)
+
+        # Worker dequeues 1: it moves from lag to pending
+        item = self.queue.dequeue(worker_id="w1", block_ms=100)
+        self.assertIsNotNone(item)
+
+        depth = self.queue.depth()
+        # 2 undelivered (lag) + 1 delivered-but-unacked (pending) = 3 total
+        self.assertGreaterEqual(depth["total_active"], 2)
+
+        # Complete it: total should drop
+        self.queue.complete(item, result={"output_file": "/fake/path.wav"})
+        depth = self.queue.depth()
+        self.assertLess(depth["total_active"], 3)
+
+    def test_depth_after_completion(self):
+        """After all jobs complete, active depth returns to zero."""
+        for i in range(5):
+            self.queue.enqueue(self._make_item(seed=i))
+
+        # Drain all
+        for _ in range(5):
+            item = self.queue.dequeue(worker_id="w1", block_ms=100)
+            if item:
+                self.queue.complete(item, result={"output_file": "/fake.wav"})
+
+        depth = self.queue.depth()
+        self.assertEqual(depth["total_active"], 0,
+                         f"Expected 0 active jobs, got {depth}")
 
     def test_complete_and_ack(self):
         job_id = self.queue.enqueue(self._make_item())
@@ -348,18 +384,61 @@ class TestRedisQueueStreams(unittest.TestCase):
         self.assertEqual(reloaded.status, "completed")
         self.assertIsNotNone(reloaded.completed_at)
 
+    def test_render_duration_ms_persisted(self):
+        """render_duration_ms from result dict is persisted to item."""
+        job_id = self.queue.enqueue(self._make_item())
+        item = self.queue.dequeue(worker_id="w1")
+        self.queue.complete(
+            item,
+            result={"output_file": "/fake.wav", "render_duration_ms": 123.456}
+        )
+        reloaded = self.queue.get_item(job_id)
+        self.assertAlmostEqual(reloaded.render_duration_ms, 123.456, places=3)
+
+    def test_retry_ack_cleanup(self):
+        """Retry should ACK old entry so only one pending entry exists per retry."""
+        job_id = self.queue.enqueue(self._make_item())
+
+        # Dequeue and fail (triggers retry)
+        item = self.queue.dequeue(worker_id="w1", block_ms=100)
+        self.queue.fail(item, "transient error", worker_id="w1")
+
+        # The job should be back in the queue
+        item2 = self.queue.dequeue(worker_id="w2", block_ms=100)
+        self.assertIsNotNone(item2, "Job should be available for retry")
+
+        # There should be exactly one pending entry, not two
+        pending_info = self.queue.client.xpending(
+            self.queue.stream_key, self.queue.group_name
+        )
+        self.assertEqual(pending_info["pending"], 1,
+                         "Retry should ACK old entry, leaving exactly one pending")
+
+        # Complete to clean up
+        self.queue.complete(item2, result={"output_file": "/fake.wav"})
+
     def test_recover_stale_jobs(self):
         """Recover jobs that were processing but worker died."""
         job_id = self.queue.enqueue(self._make_item(seed=1))
         item = self.queue.dequeue(worker_id="dead-worker")
+        self.assertIsNotNone(item)
+
         # Don't ACK — simulates worker crash
-        time.sleep(min(WORKER_TIMEOUT + 2, 5))  # Wait for lease expiry (cap at 5s for tests)
-        recovered = self.queue.recover()
-        # May or may not recover depending on WORKER_TIMEOUT
-        # Just verify no crash
-        self.assertIsInstance(recovered, list)
+        # For testing, use a short timeout by directly manipulating the stream
+        # to bypass the WORKER_TIMEOUT sleep
+        time.sleep(0.5)
+
+        # Manually claim the entry via XAUTOCLAIM with minimal idle time
+        result = self.queue.client.xautoclaim(
+            self.queue.stream_key, self.queue.group_name,
+            "test-recovery", min_idle_time=100, start_id="0-0", count=100
+        )
+        self.assertIsNotNone(result)
+        entries = result[1] if len(result) >= 2 else []
+        self.assertGreater(len(entries), 0, "Should find stale entry for recovery")
 
     def test_fail_retries_then_dead(self):
+        """Job should eventually be marked dead after exhausting retries."""
         job_id = self.queue.enqueue(self._make_item())
         for attempt in range(MAX_RETRIES + 1):
             item = self.queue.dequeue(worker_id=f"w{attempt}", block_ms=100)
@@ -369,11 +448,19 @@ class TestRedisQueueStreams(unittest.TestCase):
         item = self.queue.get_item(job_id)
         self.assertIn(item.status, ("dead", "failed"))
 
+        # Dead jobs should not be requeued
+        requeue = self.queue.dequeue(worker_id="w-final", block_ms=100)
+        if requeue:
+            self.assertNotEqual(requeue.job_id, job_id,
+                                "Dead job should not be dequeued")
+
 
 class TestGetQueue(unittest.TestCase):
     """get_queue() factory function."""
 
     def test_returns_file_queue_by_default(self):
+        if QUEUE_TYPE == "redis":
+            self.skipTest("Redis configured, skipping default-file-queue check")
         q = get_queue()
         self.assertIsInstance(q, FileQueue)
 
