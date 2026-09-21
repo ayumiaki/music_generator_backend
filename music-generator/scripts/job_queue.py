@@ -716,23 +716,21 @@ class RedisQueue(BaseQueue):
             if not pending:
                 return recovered
 
-            # Remember the original owner of each pending entry
-            entry_owners: Dict[str, str] = {}  # job_id -> consumer (worker_id)
+            # Build entry_id -> consumer map from XPENDING.
+            # XPENDING entries have message_id/consumer/time_since_delivered/times_delivered
+            # — they do NOT contain the stream message body (no job_id here).
+            entry_owners: Dict[str, str] = {}  # entry_id -> consumer (worker_id)
+            consumers: set = set()
             for entry in pending:
-                job_id = entry.get("message", {}).get("job_id")
+                entry_id = entry.get("message_id")
                 consumer = entry.get("consumer")
+                if isinstance(entry_id, bytes):
+                    entry_id = entry_id.decode()
                 if isinstance(consumer, bytes):
                     consumer = consumer.decode()
-                if job_id and consumer:
-                    entry_owners[job_id] = consumer
-
-            # Group by consumer and auto-claim stale ones
-            consumers = set()
-            for entry in pending:
-                consumer = entry.get("consumer")
-                if isinstance(consumer, bytes):
-                    consumer = consumer.decode()
-                consumers.add(consumer)
+                if entry_id and consumer:
+                    entry_owners[entry_id] = consumer
+                    consumers.add(consumer)
 
             for consumer in consumers:
                 try:
@@ -747,15 +745,19 @@ class RedisQueue(BaseQueue):
                         for entry_id, fields in result[1]:
                             if not fields:
                                 continue
+                            # Decode entry_id for lookup
+                            claimed_id = entry_id.decode() if isinstance(entry_id, bytes) else entry_id
                             job_id = fields.get(b"job_id") or fields.get("job_id")
                             if isinstance(job_id, bytes):
                                 job_id = job_id.decode()
-                            # Track dead worker for targeted cleanup
-                            dead_worker = entry_owners.get(job_id, consumer)
-                            dead_worker_jobs.append((dead_worker, job_id))
+                            # Look up the original dead worker by entry_id
+                            dead_worker = entry_owners.get(claimed_id)
                             # Route through _claim_entry for ACK tracking
                             item = self._claim_entry(job_id, entry_id, "recovery-worker")
-                            if item:
+                            if item and dead_worker:
+                                dead_worker_jobs.append((dead_worker, job_id))
+                                recovered.append(item)
+                            elif item:
                                 recovered.append(item)
                 except (redis_lib.exceptions.ResponseError, AttributeError):
                     continue

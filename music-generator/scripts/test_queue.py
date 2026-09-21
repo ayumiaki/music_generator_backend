@@ -715,6 +715,87 @@ class TestRedisRecoveryIntegration(unittest.TestCase):
         self.assertEqual(final.status, "completed")
         self.assertEqual(final.attempt, 2)
 
+    @mock.patch("job_queue.WORKER_TIMEOUT", 1)
+    def test_redis_multi_dead_worker_per_consumer_cleanup(self):
+        """Two dead workers with distinct temps; recovery cleans each correctly.
+
+        - Consumer A owns job-A, Consumer B owns job-B
+        - Both create temp files: .tmp.A.<jobA>.wav, .tmp.B.<jobB>.wav
+        - A healthy consumer C also has a temp file that must NOT be touched
+        - After recovery: A's and B's temps are deleted, C's survives
+        """
+        from render_io import temp_path
+
+        output_dir = Path(tempfile.mkdtemp())
+
+        # Consumer A dequeues job-A, Consumer B dequeues job-B
+        item_a = QueueItem(prompt="job A", mood="calm", tempo=120, key="C", length=1, seed=1)
+        item_b = QueueItem(prompt="job B", mood="calm", tempo=120, key="C", length=1, seed=2)
+        job_id_a = self.queue.enqueue(item_a)
+        job_id_b = self.queue.enqueue(item_b)
+
+        self.queue.dequeue(worker_id="consumer-A", block_ms=100)
+        self.queue.dequeue(worker_id="consumer-B", block_ms=100)
+
+        # Create temp files simulating partial renders from dead workers
+        tmp_a = temp_path(str(output_dir), "consumer-A", job_id_a)
+        tmp_b = temp_path(str(output_dir), "consumer-B", job_id_b)
+        tmp_a.write_bytes(b"partial render A")
+        tmp_b.write_bytes(b"partial render B")
+
+        # Healthy consumer C's temp file (should NOT be deleted)
+        tmp_c = temp_path(str(output_dir), "healthy-C", "unhealthy-job-999")
+        tmp_c.write_bytes(b"healthy partial")
+
+        # Wait for idle timeout
+        time.sleep(2.1)
+
+        # Recover both dead workers
+        recovered = self.queue.recover(output_dir=str(output_dir))
+        self.assertEqual(len(recovered), 2)
+
+        # Both dead workers' temps must be gone
+        self.assertFalse(tmp_a.exists(), "consumer-A's temp must be cleaned")
+        self.assertFalse(tmp_b.exists(), "consumer-B's temp must be cleaned")
+
+        # Healthy consumer's temp must survive
+        self.assertTrue(tmp_c.exists(), "healthy consumer's temp must NOT be cleaned")
+
+        # Recovered items both have attempt=2
+        for item in recovered:
+            self.assertEqual(item.attempt, 2)
+
+    @mock.patch("job_queue.WORKER_TIMEOUT", 1)
+    def test_redis_recovery_cleanup_only_after_claim(self):
+        """Cleanup only happens for items that _claim_entry actually returns.
+
+        Verifies the dead_worker_jobs list is populated only when
+        _claim_entry() produces a valid item — not for empty/stale entries.
+        """
+        from render_io import temp_path
+
+        output_dir = Path(tempfile.mkdtemp())
+
+        item = QueueItem(prompt="claim gate", mood="calm", tempo=120, key="C", length=1, seed=5)
+        job_id = self.queue.enqueue(item)
+        self.queue.dequeue(worker_id="dead-worker", block_ms=100)
+
+        tmp = temp_path(str(output_dir), "dead-worker", job_id)
+        tmp.write_bytes(b"partial")
+
+        time.sleep(2.1)
+
+        recovered = self.queue.recover(output_dir=str(output_dir))
+        self.assertEqual(len(recovered), 1)
+
+        # The temp should be cleaned because _claim_entry succeeded
+        self.assertFalse(tmp.exists())
+
+        # And it should be tracked with the correct worker
+        final = self.queue.get_item(job_id)
+        self.assertEqual(final.status, "processing")
+        self.assertEqual(final.worker_id, "recovery-worker")
+
 
 class TestGetQueue(unittest.TestCase):
     """get_queue() factory function."""
