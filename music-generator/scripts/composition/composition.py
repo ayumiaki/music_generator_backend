@@ -479,6 +479,12 @@ class Composition:
                 pitch = max(0, min(127, pitch))
                 contour_data.append((i * sub_beat, sub_beat * self.mood.articulation, pitch))
 
+            # Final hard enforcement: force every melody note to a scale tone
+            # This catches any chromatic survivors from quantization edge cases
+            scale = scale_degrees(self.root_midi, self.effective_mode)
+            scale_pcs = sorted(set(s % 12 for s in scale))
+            contour_data = [(t, d, self._quantize_to_scale(p, scale_pcs)) for t, d, p in contour_data]
+
             contour_data = self._emit_melody(section, contour_data, chord_start, sub_beat)
             return contour_data
 
@@ -664,115 +670,154 @@ class Composition:
         Detects and fixes parallel fifths/octaves in the actual emitted
         score (after A′ motif transformation and all other transformations).
 
-        For each chord transition, extracts the chord-onset voices from
-        the score's notes, detects parallels, and adjusts the offending
-        voice (melody or bass) by an octave to break them.
-
         Chords are identified by (section_index, chord_index) — never by
         pitch values, since repeated note pairs are rather central to music.
         All candidate shifts are validated against the full hard-constraint set:
         MIDI range, strict voice ordering, and no new crossings.
+
+        Iterates to a fixed point: each accepted mutation is re-scanned from
+        the previous transition, because fixing i−1 → i can break i → i+1
+        (the musical equivalent of extinguishing one room with petrol).
         """
         from .voice_leading import VOICE_RANGES
         melody_range = VOICE_RANGES["melody"]
         bass_range = VOICE_RANGES["bass"]
-        scale = scale_degrees(self.root_midi, self.effective_mode)
-        scale_pcs = sorted(set(s % 12 for s in scale))
 
-        # Collect chord-onset voices with INDEX identity (not pitch)
-        # chord_voicings[i] = (section_idx, chord_idx, bass, melody, [harmonies])
-        chord_voicings = []
-        for si, section in enumerate(score.sections):
-            for ci, chord in enumerate(section.chords):
-                t = chord.time_beats
-                bass_p = None
-                melody_p = None
-                harmony_ps = []
-                for note in section.notes:
-                    if abs(note.time_beats - t) < 0.001:
-                        if note.voice == VOICE_BASS:
-                            bass_p = note.pitch_midi
-                        elif note.voice == VOICE_MELODY:
-                            melody_p = note.pitch_midi
-                        elif note.voice == VOICE_HARMONY:
-                            harmony_ps.append(note.pitch_midi)
-                if bass_p is not None and melody_p is not None:
-                    chord_voicings.append((si, ci, bass_p, melody_p, harmony_ps))
+        def collect_voicings():
+            """Re-extract chord-onset voices from the current score state."""
+            result = []
+            for si, section in enumerate(score.sections):
+                for ci, chord in enumerate(section.chords):
+                    t = chord.time_beats
+                    bass_p = None
+                    melody_p = None
+                    harmony_ps = []
+                    for note in section.notes:
+                        if abs(note.time_beats - t) < 0.001:
+                            if note.voice == VOICE_BASS:
+                                bass_p = note.pitch_midi
+                            elif note.voice == VOICE_MELODY:
+                                melody_p = note.pitch_midi
+                            elif note.voice == VOICE_HARMONY:
+                                harmony_ps.append(note.pitch_midi)
+                    if bass_p is not None and melody_p is not None:
+                        result.append((si, ci, bass_p, melody_p, harmony_ps))
+            return result
 
-        # Check consecutive pairs
-        for i in range(1, len(chord_voicings)):
-            prev_si, prev_ci, prev_b, prev_m, prev_h = chord_voicings[i - 1]
-            curr_si, curr_ci, curr_b, curr_m, curr_h = chord_voicings[i]
+        max_iterations = 100
+        iteration = 0
+        changed = True
 
-            prev_all = [prev_b, prev_m] + prev_h
-            curr_all = [curr_b, curr_m] + curr_h
-            f, o = detect_parallel_fifths_octaves(prev_all, curr_all)
-            if f + o == 0:
-                continue
+        while changed and iteration < max_iterations:
+            changed = False
+            iteration += 1
+            chord_voicings = collect_voicings()
 
-            # Try shifting the current melody up or down by an octave
-            best_m = curr_m
-            for oct_shift in [12, -12]:
-                test_m = curr_m + oct_shift
-                if test_m < melody_range.min_midi or test_m > melody_range.max_midi:
+            for i in range(1, len(chord_voicings)):
+                prev_si, prev_ci, prev_b, prev_m, prev_h = chord_voicings[i - 1]
+                curr_si, curr_ci, curr_b, curr_m, curr_h = chord_voicings[i]
+
+                prev_all = [prev_b, prev_m] + prev_h
+                curr_all = [curr_b, curr_m] + curr_h
+                f, o = detect_parallel_fifths_octaves(prev_all, curr_all)
+
+                # Also check for bass/harmony crossing
+                min_h = min(curr_h) if curr_h else None
+                has_crossing = (min_h is not None and curr_b >= min_h)
+
+                if f + o == 0 and not has_crossing:
                     continue
-                # Enforce melody above highest harmony
-                if curr_h and test_m <= max(curr_h):
-                    continue
-                test_all = [curr_b, test_m] + curr_h
-                tf, to = detect_parallel_fifths_octaves(prev_all, test_all)
-                if tf + to < f + o:
-                    best_m = test_m
-                    break
 
-            # Try shifting the current bass
-            best_b = curr_b
-            for oct_shift in [12, -12]:
-                test_b = curr_b + oct_shift
-                if test_b < bass_range.min_midi or test_b > bass_range.max_midi:
-                    continue
-                # Enforce bass below lowest harmony
-                if curr_h and test_b >= min(curr_h):
-                    continue
-                test_all = [test_b, best_m] + curr_h
-                tf, to = detect_parallel_fifths_octaves(prev_all, test_all)
-                if tf + to < f + o:
-                    best_b = test_b
-                    break
+                # Score a candidate voicing: lower is better
+                # Heavy penalty for crossings, moderate for parallels
+                def score_voicing(test_b, test_m):
+                    test_all = [test_b, test_m] + curr_h
+                    tf, to = detect_parallel_fifths_octaves(prev_all, test_all)
+                    crossing_penalty = 1000 if (min_h is not None and test_b >= min_h) else 0
+                    return (crossing_penalty, tf + to)
 
-            # If we made changes, update the score's notes by INDEX
-            if best_m != curr_m or best_b != curr_b:
-                section = score.sections[curr_si]
-                chord = section.chords[curr_ci]
+                best_b, best_m = curr_b, curr_m
+                best_score = score_voicing(curr_b, curr_m)
 
-                # Replace notes (ScoreNote is frozen, so create new ones)
-                new_notes = []
-                for note in section.notes:
-                    if abs(note.time_beats - chord.time_beats) < 0.001:
-                        if note.voice == VOICE_BASS and best_b != curr_b:
-                            new_notes.append(ScoreNote(
-                                time_beats=note.time_beats,
-                                duration_beats=note.duration_beats,
-                                pitch_midi=best_b,
-                                amplitude=note.amplitude,
-                                voice=note.voice,
-                            ))
-                        elif note.voice == VOICE_MELODY and best_m != curr_m:
-                            new_notes.append(ScoreNote(
-                                time_beats=note.time_beats,
-                                duration_beats=note.duration_beats,
-                                pitch_midi=best_m,
-                                amplitude=note.amplitude,
-                                voice=note.voice,
-                            ))
+                # Generate candidates: try melody shifts × bass shifts
+                melody_shifts = [0, 12, -12, 24, -24]
+                bass_shifts = [0, 12, -12, 24, -24]
+
+                for m_shift in melody_shifts:
+                    test_m = curr_m + m_shift
+                    if test_m < melody_range.min_midi or test_m > melody_range.max_midi:
+                        continue
+                    if curr_h and test_m <= max(curr_h):
+                        continue
+                    for b_shift in bass_shifts:
+                        test_b = curr_b + b_shift
+                        if test_b < bass_range.min_midi or test_b > bass_range.max_midi:
+                            continue
+                        if curr_h and test_b >= min(curr_h):
+                            continue
+                        s = score_voicing(test_b, test_m)
+                        if s < best_score:
+                            best_b = test_b
+                            best_m = test_m
+                            best_score = s
+                            if best_score == (0, 0):
+                                break
+                    if best_score == (0, 0):
+                        break
+
+                # If we only have a crossing but no shift improved it, force bass down
+                if has_crossing and best_b == curr_b and min_h is not None:
+                    test_b = curr_b
+                    while test_b >= min_h and test_b - 12 >= bass_range.min_midi:
+                        test_b -= 12
+                    if test_b >= min_h:
+                        test_b = min_h - 12
+                    test_b = max(bass_range.min_midi, test_b)
+                    if test_b < min_h:
+                        best_b = test_b
+
+                # If we made changes, update the score and restart the scan
+                if best_m != curr_m or best_b != curr_b:
+                    section = score.sections[curr_si]
+                    chord = section.chords[curr_ci]
+
+                    # Replace notes (ScoreNote is frozen, so create new ones)
+                    new_notes = []
+                    for note in section.notes:
+                        if abs(note.time_beats - chord.time_beats) < 0.001:
+                            if note.voice == VOICE_BASS and best_b != curr_b:
+                                new_notes.append(ScoreNote(
+                                    time_beats=note.time_beats,
+                                    duration_beats=note.duration_beats,
+                                    pitch_midi=best_b,
+                                    amplitude=note.amplitude,
+                                    voice=note.voice,
+                                ))
+                            elif note.voice == VOICE_MELODY and best_m != curr_m:
+                                new_notes.append(ScoreNote(
+                                    time_beats=note.time_beats,
+                                    duration_beats=note.duration_beats,
+                                    pitch_midi=best_m,
+                                    amplitude=note.amplitude,
+                                    voice=note.voice,
+                                ))
+                            else:
+                                new_notes.append(note)
                         else:
                             new_notes.append(note)
-                    else:
-                        new_notes.append(note)
-                section.notes = new_notes
+                    section.notes = new_notes
 
-                # Update the chord_voicings list for subsequent checks
-                chord_voicings[i] = (curr_si, curr_ci, best_b, best_m, curr_h)
+                    # Signal fixed-point iteration to restart the scan
+                    changed = True
+                    break  # restart from i=1 to recheck adjacent transitions
+
+        # Report residual parallels after fixed point (for audit logging)
+        if iteration >= max_iterations:
+            import warnings
+            warnings.warn(
+                f"_post_validate_score hit max_iterations={max_iterations}; "
+                "residual parallels may remain"
+            )
 
 
 def score_to_dict(score: Score) -> dict:
