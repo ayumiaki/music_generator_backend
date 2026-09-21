@@ -1,0 +1,13 @@
+{
+  "job_id": "b067d590-1460-49ba-96f5-03c1a263900e",
+  "prompt": "hi",
+  "mood": "neutral",
+  "tempo": 120,
+  "key": "C",
+  "length": 30,
+  "seed": 555,
+  "status": "pending",
+  "result": {},
+  "created_at": 1789977877.9825673,
+  "updated_at": 1789977877.9825716
+}

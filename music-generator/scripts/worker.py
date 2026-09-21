@@ -71,6 +71,13 @@ def main():
     queue = get_queue()
     backend = get_backend()
 
+    # Recover any jobs stuck in processing state after a crash
+    recovered = queue.recover()
+    if recovered:
+        print(f"Recovered {len(recovered)} job(s) from previous crash")
+        for item in recovered:
+            process_job(queue, backend, item)
+
     def signal_handler(sig, frame):
         print("\nShutting down worker...")
         sys.exit(0)

@@ -1,0 +1,13 @@
+{
+  "job_id": "abca285c-382f-4e62-a86b-84799d886359",
+  "prompt": "test",
+  "mood": "neutral",
+  "tempo": 120,
+  "key": "C",
+  "length": 30,
+  "seed": 999,
+  "status": "pending",
+  "result": {},
+  "created_at": 1789977826.687751,
+  "updated_at": 1789977826.6877542
+}

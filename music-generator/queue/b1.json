@@ -1,0 +1,13 @@
+{
+  "job_id": "b1",
+  "prompt": "y",
+  "mood": "c",
+  "tempo": 110,
+  "key": "D",
+  "length": 15,
+  "seed": 13,
+  "status": "pending",
+  "result": {},
+  "created_at": 1789977893.6092205,
+  "updated_at": 1789977893.6092205
+}

@@ -1,0 +1,24 @@
+{
+  "job_id": "test_seed_1",
+  "prompt": "test",
+  "mood": "chill",
+  "tempo": 90,
+  "key": "C",
+  "length": 30,
+  "seed": 42,
+  "status": "processing",
+  "result": {
+    "status": "success",
+    "output_file": "/tmp/music_backend/music-generator/output/test_seed_1.txt",
+    "metadata": {
+      "sample_rate": 0,
+      "duration": 30,
+      "key": "C",
+      "tempo": 90,
+      "mood": "chill",
+      "note": "Generated placeholder text file; install numpy and scipy for audio output."
+    }
+  },
+  "created_at": 1789977751.6364892,
+  "updated_at": 1789977900.006166
+}

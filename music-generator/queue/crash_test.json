@@ -1,0 +1,13 @@
+{
+  "job_id": "crash_test",
+  "prompt": "crash",
+  "mood": "chill",
+  "tempo": 90,
+  "key": "C",
+  "length": 5,
+  "seed": 555,
+  "status": "pending",
+  "result": {},
+  "created_at": 1789977822.483888,
+  "updated_at": 1789977822.4838884
+}

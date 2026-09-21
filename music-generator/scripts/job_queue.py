@@ -29,13 +29,14 @@ class QueueItem:
     """Represents a job in the queue."""
 
     def __init__(self, job_id: str, prompt: str, mood: str, tempo: int, key: str, length: int,
-                 status: str = "pending", result: Optional[Dict] = None, created_at: float = None):
+                 seed: Optional[int] = None, status: str = "pending", result: Optional[Dict] = None, created_at: float = None):
         self.job_id = job_id
         self.prompt = prompt
         self.mood = mood
         self.tempo = tempo
         self.key = key
         self.length = length
+        self.seed = seed  # persisted with job, restored on recovery
         self.status = status  # pending, processing, completed, failed
         self.result = result or {}
         self.created_at = created_at or time.time()
@@ -49,6 +50,7 @@ class QueueItem:
             "tempo": self.tempo,
             "key": self.key,
             "length": self.length,
+            "seed": self.seed,
             "status": self.status,
             "result": self.result,
             "created_at": self.created_at,
@@ -64,6 +66,7 @@ class QueueItem:
             tempo=data["tempo"],
             key=data["key"],
             length=data["length"],
+            seed=data.get("seed"),
             status=data.get("status", "pending"),
             result=data.get("result", {}),
             created_at=data.get("created_at", time.time())
@@ -96,6 +99,11 @@ class BaseQueue(ABC):
         pass
 
     @abstractmethod
+    def recover(self) -> List[QueueItem]:
+        """Pick up jobs stuck in processing state after a crash."""
+        pass
+
+    @abstractmethod
     def remove_item(self, job_id: str) -> bool:
         pass
 
@@ -103,14 +111,21 @@ class BaseQueue(ABC):
 class FileQueue(BaseQueue):
     """File-based queue storing each job as a JSON file in QUEUE_DIR."""
 
-    def __init__(self):
-        QUEUE_DIR.mkdir(exist_ok=True)
-        self.queue_file = QUEUE_DIR / "queue.json"  # simple list of job IDs
+    def __init__(self, queue_dir=None):
+        self.queue_dir = Path(queue_dir) if queue_dir else QUEUE_DIR
+        self.queue_dir.mkdir(exist_ok=True)
+        self.queue_file = self.queue_dir / "queue.json"  # simple list of job IDs
         self._ensure_queue_file()
+
+    def _atomic_write(self, path: Path, content: str):
+        """Atomic write: write to temp file then rename."""
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(content)
+        tmp.replace(path)
 
     def _ensure_queue_file(self):
         if not self.queue_file.exists():
-            self.queue_file.write_text("[]")
+            self._atomic_write(self.queue_file, "[]")
 
     def _read_queue_ids(self) -> List[str]:
         try:
@@ -119,19 +134,16 @@ class FileQueue(BaseQueue):
             return []
 
     def _write_queue_ids(self, ids: List[str]):
-        self.queue_file.write_text(json.dumps(ids, indent=2))
+        self._atomic_write(self.queue_file, json.dumps(ids, indent=2))
 
     def _job_file_path(self, job_id: str) -> Path:
         return QUEUE_DIR / f"{job_id}.json"
 
     def enqueue(self, item: QueueItem) -> str:
-        # Ensure job_id exists
         if not item.job_id:
             item.job_id = str(uuid.uuid4())
-        # Save job data
         job_file = self._job_file_path(item.job_id)
-        job_file.write_text(json.dumps(item.to_dict(), indent=2))
-        # Add to queue list
+        self._atomic_write(job_file, json.dumps(item.to_dict(), indent=2))
         ids = self._read_queue_ids()
         if item.job_id not in ids:
             ids.append(item.job_id)
@@ -142,14 +154,32 @@ class FileQueue(BaseQueue):
         ids = self._read_queue_ids()
         if not ids:
             return None
-        # Take first ID (FIFO)
-        job_id = ids.pop(0)
-        self._write_queue_ids(ids)
+        # Take first ID (FIFO) but keep it in the list for crash recovery
+        job_id = ids[0]
         job_file = self._job_file_path(job_id)
         if job_file.exists():
             data = json.loads(job_file.read_text())
-            return QueueItem.from_dict(data)
+            item = QueueItem.from_dict(data)
+            # Mark as processing in place - do NOT remove from queue list
+            item.status = "processing"
+            self._atomic_write(job_file, json.dumps(item.to_dict(), indent=2))
+            return item
         return None
+
+    def recover(self) -> List[QueueItem]:
+        """Pick up any jobs stuck in 'processing' state after a crash."""
+        ids = self._read_queue_ids()
+        recovered = []
+        for job_id in ids:
+            job_file = self._job_file_path(job_id)
+            if job_file.exists():
+                data = json.loads(job_file.read_text())
+                item = QueueItem.from_dict(data)
+                if item.status == "processing":
+                    item.status = "pending"
+                    self._atomic_write(job_file, json.dumps(item.to_dict(), indent=2))
+                    recovered.append(item)
+        return recovered
 
     def get_item(self, job_id: str) -> Optional[QueueItem]:
         job_file = self._job_file_path(job_id)
@@ -230,6 +260,22 @@ if QUEUE_TYPE == "redis" and REDIS_AVAILABLE:
 
         def update_item(self, item: QueueItem) -> None:
             self.client.hset(self.hash_key, item.job_id, json.dumps(item.to_dict()))
+
+        def recover(self) -> List[QueueItem]:
+            """Pick up jobs stuck in processing state after a crash."""
+            all_ids = self.client.hkeys(self.hash_key)
+            recovered = []
+            for job_id in all_ids:
+                job_id = job_id.decode() if isinstance(job_id, bytes) else job_id
+                data = self.client.hget(self.hash_key, job_id)
+                if data:
+                    data = json.loads(data.decode() if isinstance(data, bytes) else data)
+                    item = QueueItem.from_dict(data)
+                    if item.status == "processing":
+                        item.status = "pending"
+                        self.client.hset(self.hash_key, job_id, json.dumps(item.to_dict()))
+                        recovered.append(item)
+            return recovered
 
         def list_items(self, limit: int = 100) -> List[QueueItem]:
             # Get all job IDs from hash

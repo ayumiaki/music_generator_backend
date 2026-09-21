@@ -5,29 +5,38 @@ otherwise writes a placeholder text file.
 """
 
 import time
-import numpy as np
 from pathlib import Path
 from .base_backend import BaseBackend
+from config import MOCK_MIN_DELAY, MOCK_MAX_DELAY
 
 
 class MockBackend(BaseBackend):
     def __init__(self):
         super().__init__()
-        # Check if we can generate real audio
+        # Lazy-import numpy/scipy so module loads without them
         self._can_generate_audio = False
         try:
             import numpy  # noqa: F401
             from scipy.io import wavfile  # noqa: F401
             self._can_generate_audio = True
         except ImportError:
-            pass  # Stay with fallback
+            pass
 
     def generate(self, job_id: str, prompt: str, mood: str, tempo: int, key: str, length: int) -> dict:
+        # Lazy-import numpy for random delay
+        np = None
+        if self._can_generate_audio:
+            try:
+                import numpy as _np
+                np = _np
+            except ImportError:
+                self._can_generate_audio = False
+
         # Simulate processing delay
-        delay = np.random.uniform(
-            float(__import__('..config').config.MOCK_MIN_DELAY),
-            float(__import__('..config').config.MOCK_MAX_DELAY)
-        ) if self._can_generate_audio else 0.01
+        if np is not None:
+            delay = np.random.uniform(float(MOCK_MIN_DELAY), float(MOCK_MAX_DELAY))
+        else:
+            delay = 0.01
         time.sleep(delay)
 
         output_file = self.output_dir / f"{job_id}.wav"

@@ -10,7 +10,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 # Queue settings
 QUEUE_TYPE = os.getenv("MG_QUEUE_TYPE", "file")  # file or redis
-QUEUE_DIR = BASE_DIR / "queue"
+QUEUE_DIR = Path(os.getenv("MG_QUEUE_DIR", BASE_DIR / "queue"))
 
 # Redis settings (used only if QUEUE_TYPE == "redis")
 REDIS_HOST = os.getenv("MG_REDIS_HOST", "localhost")
@@ -36,3 +36,6 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 # HTTP API settings (future)
 HOST = os.getenv("MG_HOST", "0.0.0.0")
 PORT = int(os.getenv("MG_PORT", 8000))
+
+# API authentication
+MG_API_TOKEN = os.getenv("MG_API_TOKEN", "")
