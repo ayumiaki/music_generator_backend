@@ -14,6 +14,7 @@ import random
 import time
 import uuid
 from pathlib import Path
+from typing import Optional
 
 from flask import Flask, request, jsonify, send_file
 
@@ -64,23 +65,27 @@ def health():
 
 @app.route('/queue/status', methods=['GET'])
 def queue_status():
-    """Return queue metrics for monitoring."""
-    # Use get_metrics() if available (RedisQueue), else fall back to counting
-    if hasattr(queue, 'get_metrics'):
-        metrics = queue.get_metrics()
-        return jsonify(metrics)
-    items = queue.list_items(limit=200)
-    pending = sum(1 for i in items if i.status == "pending")
-    processing = sum(1 for i in items if i.status == "processing")
+    """Return queue metrics for monitoring. Consistent schema across queue types."""
+    depth = queue.depth()
+    # depth is a dict: {"pending": N, "processing": N, "total_active": N}
+    pending = depth.get("pending", 0)
+    processing = depth.get("processing", 0)
+    total_active = depth.get("total_active", pending + processing)
+
+    # Count terminal states via list_items (best effort)
+    items = queue.list_items(limit=500)
     completed = sum(1 for i in items if i.status == "completed")
     failed = sum(1 for i in items if i.status == "failed")
+    dead = sum(1 for i in items if i.status == "dead")
+
     return jsonify({
         "queue_type": "redis" if QUEUE_TYPE == "redis" else "file",
-        "depth": queue.depth(),
+        "queue_depth": total_active,
         "pending": pending,
         "processing": processing,
         "completed": completed,
         "failed": failed,
+        "dead": dead,
         "total_tracked": len(items),
     })
 
@@ -165,12 +170,52 @@ def generate():
         'seed': seed
     }), 202
 
+def _parse_wav_header(path: str) -> Optional[dict]:
+    """Parse a WAV file header, returning None if invalid or not a WAV."""
+    import struct
+    try:
+        with open(path, 'rb') as f:
+            data = f.read(44)
+        if len(data) < 44:
+            return None
+        if data[:4] != b'RIFF' or data[8:12] != b'WAVE':
+            return None
+        fmt_tag = struct.unpack_from('<H', data, 20)[0]
+        channels = struct.unpack_from('<H', data, 22)[0]
+        sample_rate = struct.unpack_from('<I', data, 24)[0]
+        byte_rate = struct.unpack_from('<I', data, 28)[0]
+        bits_per_sample = struct.unpack_from('<H', data, 34)[0]
+        file_size = os.path.getsize(path)
+        data_size = struct.unpack_from('<I', data, 40)[0]
+        duration = data_size / byte_rate if byte_rate > 0 else 0
+        return {
+            "format": "wav",
+            "audio_format": "PCM" if fmt_tag == 1 else f"0x{fmt_tag:04x}",
+            "channels": channels,
+            "sample_rate": sample_rate,
+            "byte_rate": byte_rate,
+            "bits_per_sample": bits_per_sample,
+            "file_size": file_size,
+            "data_size": data_size,
+            "duration_sec": round(duration, 3),
+        }
+    except (OSError, struct.error):
+        return None
+
+
 @app.route('/status/<job_id>', methods=['GET'])
 def status(job_id):
     item = queue.get_item(job_id)
     if item is None:
         return jsonify({'error': 'not found'}), 404
-    return jsonify(item.to_dict())
+    resp = item.to_dict()
+    # Add WAV header info for completed jobs with a WAV artifact
+    output_file = item.result.get('output_file') if item.result else None
+    if item.status == 'completed' and output_file and output_file.endswith('.wav'):
+        wav_info = _parse_wav_header(output_file)
+        if wav_info:
+            resp['wav_header'] = wav_info
+    return jsonify(resp)
 
 @app.route('/artifact/<job_id>', methods=['GET'])
 def artifact(job_id):

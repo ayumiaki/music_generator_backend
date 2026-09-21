@@ -33,7 +33,7 @@ except ImportError:
     REDIS_CONSUMER_GROUP = "renderers"
     REDIS_DEAD_LETTER_KEY = "music_gen:jobs:dead"
     MAX_RETRIES = 3
-    WORKER_TIMEOUT = 300
+    WORKER_TIMEOUT = int(os.environ.get('MG_WORKER_TIMEOUT', '300'))
     CLAIM_BATCH_SIZE = 1
 
 
