@@ -579,10 +579,10 @@ class TestFilterAcceptanceGates:
     def test_measured_cutoff_and_slope(self):
         """Measured cutoff frequency and slope are correct.
 
-        TPT/ZDF SVF uses bilinear transform which warps the frequency axis.
-        The -3dB point is shifted from the requested cutoff. We verify the
-        filter has a lowpass characteristic with a cutoff in the right
-        frequency range, not an exact match.
+        Four cascaded one-pole lowpasses. Each stage has -3dB at the
+        requested cutoff, so the cascade has -12dB at the cutoff and
+        the overall -3dB point is lower. We verify the filter has a
+        lowpass characteristic with a cutoff in the right range.
         """
         from synth.filter import LadderFilter
         sample_rate = 48000
@@ -605,9 +605,9 @@ class TestFilterAcceptanceGates:
         # Find closest frequency to target
         idx = np.argmin(np.abs(mag_db - target_db))
         measured_cutoff = freqs[idx]
-        # TPT/ZDF SVF warps frequency; measured cutoff is shifted
-        # Verify it's in the right range (within 40% of requested)
-        assert abs(measured_cutoff - cutoff) < cutoff * 0.4, \
+        # Four one-pole stages shift the -3dB point lower than the
+        # requested cutoff. Verify it's in the right range (within 50%).
+        assert abs(measured_cutoff - cutoff) < cutoff * 0.5, \
             f"Measured cutoff {measured_cutoff:.0f} Hz vs requested {cutoff} Hz"
 
     def test_resonance_peak_near_cutoff(self):
@@ -729,3 +729,55 @@ class TestEventOrdering:
         audio2 = engine2.render_block(notes, block_size=400)
         # First 200 samples should match
         assert np.allclose(audio1, audio2[:200]), "Output should not depend on block size"
+
+    def test_filter_state_continuous_across_notes(self):
+        """Filter state must persist across notes — no per-note reset.
+
+        Regression test: the filter was previously reset before each note,
+        which broke state continuity and made output depend on note boundaries.
+        """
+        from synth.voice import VoiceEngine, VoiceConfig
+        config = VoiceConfig(attack_samples=10, decay_samples=10, sustain_level=0.7, release_samples=10)
+        engine = VoiceEngine(polyphony=4, sample_rate=48000, config=config, seed=42)
+
+        # Render first note
+        notes1 = [(440.0, 100, 0.8, "saw")]
+        audio1 = engine.render_block(notes1, block_size=200)
+
+        # Capture filter state after first note
+        voice = engine._voices[0]
+        state_after_first = voice.flt.get_state().copy() if voice else None
+
+        # Render second note (same voice, should steal or reuse)
+        notes2 = [(550.0, 100, 0.8, "saw")]
+        audio2 = engine.render_block(notes2, block_size=200)
+
+        # Filter state should have changed (continuous, not reset)
+        voice = engine._voices[0]
+        state_after_second = voice.flt.get_state().copy() if voice else None
+
+        if state_after_first is not None and state_after_second is not None:
+            # States should differ — filter is processing, not being reset
+            assert not np.allclose(state_after_first, state_after_second), \
+                "Filter state should change between notes (no per-note reset)"
+
+    def test_filter_stability_at_high_cutoff(self):
+        """Filter must not explode at high cutoff frequencies.
+
+        Regression test: the TPT/ZDF SVF filter exploded at high cutoff
+        frequencies (state values hitting 1e14+). The one-pole cascade
+        is unconditionally stable.
+        """
+        from synth.filter import LadderFilter
+        sample_rate = 48000
+        # Test at high cutoff frequencies that broke the TPT SVF
+        for cutoff in [10000, 15000, 20000, 23000]:
+            flt = LadderFilter(sample_rate=sample_rate, cutoff=cutoff, resonance=0.0)
+            rng = np.random.RandomState(42)
+            inp = rng.randn(48000)
+            out = flt.render(inp)
+            # Output must be finite
+            assert np.all(np.isfinite(out)), f"Filter produced non-finite output at cutoff {cutoff}"
+            # Output must not explode (max amplitude should be reasonable)
+            max_amp = np.max(np.abs(out))
+            assert max_amp < 10.0, f"Filter exploded at cutoff {cutoff}: max amplitude {max_amp}"

@@ -180,8 +180,7 @@ class VoiceEngine:
             voice.env.note_on()
             env_out = voice.env.render(total_samples)
 
-            # Apply filter
-            voice.flt.reset()
+            # Apply filter — state is continuous across notes (no reset)
             signal = osc_out * env_out * amp
             filtered = voice.flt.render(signal)
 
