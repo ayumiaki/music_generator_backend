@@ -323,7 +323,57 @@ class Composition:
         # transformation or other post-voicing modifications.
         self._post_validate_score(score)
 
+        # Dedicated bass-crossing pass: post-validator only checks consecutive
+        # pairs, so the first chord's bass crossing can slip through. Also
+        # catches any crossings introduced by melody shifts.
+        self._fix_bass_crossings(score)
+
         return score
+
+    def _fix_bass_crossings(self, score: Score) -> None:
+        """Ensure bass is strictly below the lowest harmony note for every chord.
+
+        This is a dedicated pass because _post_validate_score only checks
+        consecutive pairs and may miss the first chord or crossings introduced
+        by melody-only shifts.
+        """
+        bass_range = VOICE_RANGES["bass"]
+        for section in score.sections:
+            for chord in section.chords:
+                t = chord.time_beats
+                bass_note = None
+                harmony_min = None
+                for note in section.notes:
+                    if abs(note.time_beats - t) < 0.001:
+                        if note.voice == VOICE_BASS:
+                            bass_note = note
+                        elif note.voice == VOICE_HARMONY:
+                            if harmony_min is None or note.pitch_midi < harmony_min:
+                                harmony_min = note.pitch_midi
+
+                if bass_note is None or harmony_min is None:
+                    continue
+                if bass_note.pitch_midi < harmony_min:
+                    continue  # Already OK
+
+                # Shift bass down by octaves until below harmony
+                new_bass = bass_note.pitch_midi
+                while new_bass >= harmony_min and new_bass - 12 >= bass_range.min_midi:
+                    new_bass -= 12
+                if new_bass >= harmony_min:
+                    # Can't go lower — use min_midi and accept the crossing
+                    # (this should not happen with correct range config)
+                    new_bass = bass_range.min_midi
+
+                if new_bass != bass_note.pitch_midi:
+                    note_idx = section.notes.index(bass_note)
+                    section.notes[note_idx] = ScoreNote(
+                        time_beats=bass_note.time_beats,
+                        duration_beats=bass_note.duration_beats,
+                        pitch_midi=new_bass,
+                        amplitude=bass_note.amplitude,
+                        voice=bass_note.voice,
+                    )
 
     def _scale_ceiling(self, pitch: int, scale_pcs: list[int], max_midi: int) -> int:
         """Find the nearest scale tone at or above `pitch`, up to max_midi.
@@ -445,6 +495,11 @@ class Composition:
                     )
                     shifted.append((t_off, dur, pitch))
                 contour_data = shifted
+            # Final hard enforcement: force every melody note to a scale tone.
+            scale = scale_degrees(self.root_midi, self.effective_mode)
+            scale_pcs = sorted(set(s % 12 for s in scale))
+            contour_data = [(t, d, self._quantize_to_scale(p, scale_pcs)) for t, d, p in contour_data]
+
             contour_data = self._emit_melody(section, contour_data, chord_start, sub_beat)
             return contour_data
         else:
