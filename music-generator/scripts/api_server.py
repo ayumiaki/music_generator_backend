@@ -47,6 +47,20 @@ def _require_auth():
 def health():
     return jsonify({"status": "ok", "queue": "file", "backend": "mock"})
 
+def _validate_int(value, field_name, min_val=None, max_val=None):
+    """Validate and convert a value to int, returning (error_dict, status_code) or (None, int_value)."""
+    if value is None:
+        return None, None
+    try:
+        ival = int(value)
+    except (TypeError, ValueError):
+        return {"error": f"{field_name} must be an integer"}, 400
+    if min_val is not None and ival < min_val:
+        return {"error": f"{field_name} must be between {min_val} and {max_val}"}, 400
+    if max_val is not None and ival > max_val:
+        return {"error": f"{field_name} must be between {min_val} and {max_val}"}, 400
+    return None, ival
+
 @app.route('/generate', methods=['POST'])
 def generate():
     data = request.get_json(force=True)
@@ -59,34 +73,35 @@ def generate():
 
     mood = data.get('mood', 'neutral')
     key = data.get('key', 'C')
-    length = data.get('length', 30)
-    tempo = data.get('tempo', 120)
-    seed = data.get('seed')  # None if omitted
+    length_raw = data.get('length', 30)
+    tempo_raw = data.get('tempo', 120)
+    seed_raw = data.get('seed')  # None if omitted
 
-    try:
-        length = int(length)
-    except (TypeError, ValueError):
-        return jsonify({"error": "length must be an integer"}), 400
-    if not (1 <= length <= 300):
-        return jsonify({"error": "length must be between 1 and 300"}), 400
+    # Validate length
+    err, length = _validate_int(length_raw, "length", 1, 300)
+    if err:
+        return jsonify(err), 400
+    if length is None:
+        return jsonify({"error": "length is required"}), 400
 
-    try:
-        tempo = int(tempo)
-    except (TypeError, ValueError):
-        return jsonify({"error": "tempo must be an integer"}), 400
-    if not (40 <= tempo <= 300):
-        return jsonify({"error": "tempo must be between 40 and 300"}), 400
+    # Validate tempo
+    err, tempo = _validate_int(tempo_raw, "tempo", 40, 300)
+    if err:
+        return jsonify(err), 400
+    if tempo is None:
+        return jsonify({"error": "tempo is required"}), 400
 
-    if seed is not None:
-        try:
-            seed = int(seed)
-        except (TypeError, ValueError):
-            return jsonify({"error": "seed must be an integer"}), 400
+    # Validate seed if provided
+    seed = None
+    if seed_raw is not None:
+        err, seed = _validate_int(seed_raw, "seed")
+        if err:
+            return jsonify(err), 400
 
     job_id = str(uuid.uuid4())
     created_at = time.time()
 
-    # Generate and persist a seed when omitted
+    # Generate and persist a seed when omitted — must never stay null
     if seed is None:
         seed = random.randint(0, 2**31 - 1)
 

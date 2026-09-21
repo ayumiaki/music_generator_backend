@@ -4,13 +4,13 @@ Polls the queue, processes pending jobs with the selected backend,
 and updates job status.
 """
 
-import time
 import signal
+import time
 import sys
 from pathlib import Path
 
 # Add scripts directory to path
-SCRIPTS_DIR = Path(__file__).parent
+SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
@@ -19,13 +19,20 @@ from job_queue import get_queue, QueueItem
 from backends.base_backend import BaseBackend
 
 
+class JobTimeoutError(Exception):
+    pass
+
+
+def _timeout_handler(signum, frame):
+    raise JobTimeoutError(f"Job exceeded timeout of {JOB_TIMEOUT}s")
+
+
 def get_backend() -> BaseBackend:
     """Instantiate the configured backend."""
     if BACKEND_TYPE == "mock":
         from backends.mock_backend import MockBackend
         return MockBackend()
     else:
-        # Future: import real backend based on config
         raise NotImplementedError(f"Backend type '{BACKEND_TYPE}' not implemented")
 
 
@@ -35,7 +42,9 @@ def process_job(queue, backend, item: QueueItem) -> None:
     item.status = "processing"
     queue.update_item(item)
 
-    started = time.time()
+    # Install alarm-based timeout before calling backend
+    old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+    old_alarm = signal.alarm(JOB_TIMEOUT)
     try:
         result = backend.generate(
             job_id=item.job_id,
@@ -46,21 +55,27 @@ def process_job(queue, backend, item: QueueItem) -> None:
             length=item.length,
             seed=item.seed,
         )
-        # Check timeout
-        if time.time() - started > JOB_TIMEOUT:
-            queue.fail(item, f"Job exceeded timeout of {JOB_TIMEOUT}s")
-            print(f"Job {item.job_id} timed out after {JOB_TIMEOUT}s")
-            return
-
+        signal.alarm(0)  # cancel alarm on success
         if result.get("status") == "success":
             queue.complete(item, result)
             print(f"Job {item.job_id} completed successfully")
         else:
             queue.fail(item, result.get("error", "Backend returned failure"))
             print(f"Job {item.job_id} failed: {result.get('error')}")
+    except JobTimeoutError:
+        signal.alarm(0)
+        queue.fail(item, f"Job exceeded timeout of {JOB_TIMEOUT}s")
+        print(f"Job {item.job_id} timed out after {JOB_TIMEOUT}s")
     except Exception as e:
+        signal.alarm(0)
         queue.fail(item, f"Worker exception: {str(e)}")
         print(f"Job {item.job_id} failed with exception: {e}")
+    finally:
+        # Restore previous alarm state
+        if old_alarm:
+            signal.alarm(old_alarm)
+        else:
+            signal.signal(signal.SIGALRM, old_handler)
 
 
 def main():
@@ -89,16 +104,11 @@ def main():
 
     while True:
         try:
-            # Dequeue a pending job (FIFO)
             item = queue.dequeue()
             if item is None:
-                # No pending jobs, wait
                 time.sleep(POLL_INTERVAL)
                 continue
-
-            # Process the job
             process_job(queue, backend, item)
-
         except Exception as e:
             print(f"Worker error: {e}")
             time.sleep(POLL_INTERVAL)

@@ -67,6 +67,9 @@ class MockBackend(BaseBackend):
                 # Default to A4 if key not found
                 freq = note_frequencies.get(key.upper(), 440.0)
                 # Adjust tempo? Not needed for tone length
+                # Apply seed for reproducibility if provided
+                if seed is not None:
+                    np.random.seed(seed)
                 audio = np.sin(freq * 2 * np.pi * t)
                 # Apply envelope to avoid clicks
                 envelope = np.ones_like(audio)

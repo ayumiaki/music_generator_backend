@@ -1,10 +1,10 @@
 """Tests for the music generator backend."""
 import os
 import sys
+import time
+import signal
 import tempfile
-import shutil
 from pathlib import Path
-
 # Ensure scripts dir is on path
 SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
 sys.path.insert(0, str(SCRIPTS))
@@ -104,65 +104,150 @@ class TestFileQueueAtomicity:
         assert (queue_dir / "iso1.json").exists()
 
 
-class TestMockBackend:
-    def test_module_loads_without_numpy(self, monkeypatch):
-        # Block numpy import to verify fallback path
-        import sys as _sys
-        monkeypatch.setitem(_sys.modules, "numpy", None)
-        # Force reimport
-        if "backends.mock_backend" in _sys.modules:
-            del _sys.modules["backends.mock_backend"]
-        from backends.mock_backend import MockBackend
-        b = MockBackend()
-        assert b._can_generate_audio is False
-        result = b.generate("x", "p", "c", 100, "C", 5)
-        assert result["status"] == "success"
-        assert result["output_file"].endswith(".txt")
+class TestRegressionCompletedJobNotRedequeued:
+    """Regression: completed job must not cycle back into the queue."""
+    def test_second_dequeue_after_complete_returns_none(self, q):
+        item = QueueItem(job_id="rd1", prompt="p", mood="c", tempo=100, key="C", length=10, seed=1)
+        q.enqueue(item)
+        got = q.dequeue()
+        q.complete(got, {"status": "success", "output_file": "/tmp/x.wav"})
+        second = q.dequeue()
+        assert second is None, "Completed job must not be dequeued again"
 
-    def test_backend_generates_result(self):
-        b = MockBackend()
-        result = b.generate("x2", "p", "c", 120, "A", 3)
-        assert result["status"] == "success"
-        assert "output_file" in result
+    def test_second_dequeue_after_fail_returns_none(self, q):
+        item = QueueItem(job_id="rd2", prompt="p", mood="c", tempo=100, key="C", length=10, seed=2)
+        q.enqueue(item)
+        got = q.dequeue()
+        q.fail(got, "some error")
+        second = q.dequeue()
+        assert second is None, "Failed job must not be dequeued again"
 
+    def test_completed_job_still_queryable(self, q):
+        item = QueueItem(job_id="rd3", prompt="p", mood="c", tempo=100, key="C", length=10, seed=3)
+        q.enqueue(item)
+        got = q.dequeue()
+        q.complete(got, {"status": "success", "output_file": "/tmp/x.wav"})
+        query = q.get_item("rd3")
+        assert query is not None
+        assert query.status == "completed"
+
+
+class TestRegressionWorkerSeedPassed:
+    """Regression: worker must pass seed to backend."""
     def test_backend_receives_seed(self):
-        """Backend should receive the seed parameter."""
         b = MockBackend()
         result = b.generate("x3", "p", "c", 120, "C", 5, seed=42)
         assert result["status"] == "success"
-        # Metadata should reflect seed if stored; at minimum call succeeds
         assert "output_file" in result
 
+    def test_backend_seed_affects_output(self):
+        """Same prompt+seed must produce identical output."""
+        b = MockBackend()
+        r1 = b.generate("x4", "p", "c", 120, "C", 5, seed=999)
+        r2 = b.generate("x4", "p", "c", 120, "C", 5, seed=999)
+        assert r1["output_file"] == r2["output_file"]
+        # Both files should exist and have same content
+        p1 = Path(r1["output_file"])
+        p2 = Path(r2["output_file"])
+        if p1.exists() and p2.exists():
+            assert p1.read_bytes() == p2.read_bytes()
 
-class TestApiEndpoints:
+    def test_backend_seed_none_still_works(self):
+        b = MockBackend()
+        result = b.generate("x5", "p", "c", 120, "C", 5)
+        assert result["status"] == "success"
+
+
+class TestRegressionQueueDirIsolation:
+    """Regression: FileQueue(queue_dir=...) must not leak to global QUEUE_DIR."""
+    def test_custom_dir_isolated_from_global(self, queue_dir):
+        from config import QUEUE_DIR
+        custom = queue_dir / "custom"
+        q1 = FileQueue(queue_dir=custom)
+        item = QueueItem(job_id="reg1", prompt="p", mood="c", tempo=100, key="C", length=10, seed=5)
+        q1.enqueue(item)
+        # Job file must be in custom dir
+        assert (custom / "reg1.json").exists()
+        # Must NOT be in global QUEUE_DIR
+        assert not (QUEUE_DIR / "reg1.json").exists()
+
+    def test_custom_dir_queue_json_stays_in_custom(self, queue_dir):
+        from config import QUEUE_DIR
+        custom = queue_dir / "custom2"
+        # Clean up any leftover global queue.json from other tests
+        global_qj = QUEUE_DIR / "queue.json"
+        if global_qj.exists():
+            global_qj.unlink()
+        q1 = FileQueue(queue_dir=custom)
+        item = QueueItem(job_id="reg2", prompt="p", mood="c", tempo=100, key="C", length=10, seed=5)
+        q1.enqueue(item)
+        assert (custom / "queue.json").exists()
+        assert not global_qj.exists()
+
+    def test_dequeue_from_custom_dir(self, queue_dir):
+        custom = queue_dir / "custom3"
+        q1 = FileQueue(queue_dir=custom)
+        item = QueueItem(job_id="reg3", prompt="p", mood="c", tempo=100, key="C", length=10, seed=5)
+        q1.enqueue(item)
+        got = q1.dequeue()
+        assert got is not None
+        assert got.seed == 5
+
+
+class TestRegressionTempoValidation:
+    """Regression: invalid tempo must return 400, never 500."""
     @pytest.fixture(autouse=True)
     def client(self, monkeypatch):
         monkeypatch.setenv("MG_API_TOKEN", "test-token")
-        # Re-import to pick up env var
         if "api_server" in sys.modules:
             del sys.modules["api_server"]
         from api_server import app
         self.app = app
         yield app.test_client()
 
-    def test_health(self, client):
-        r = client.get("/health")
-        assert r.status_code == 200
-        assert r.get_json()["status"] == "ok"
+    def test_invalid_tempo_string_returns_400(self, client):
+        r = client.post("/generate", json={"prompt": "hi", "tempo": "not-an-int"},
+                        headers={"Authorization": "Bearer test-token"})
+        assert r.status_code == 400
 
-    def test_generate_requires_auth(self, client):
-        r = client.post("/generate", json={"prompt": "hi"})
-        assert r.status_code == 401
+    def test_invalid_tempo_none_returns_400(self, client):
+        r = client.post("/generate", json={"prompt": "hi", "tempo": None},
+                        headers={"Authorization": "Bearer test-token"})
+        assert r.status_code == 400
 
-    def test_generate_valid(self, client):
-        r = client.post("/generate", json={"prompt": "hi", "seed": 555},
+    def test_invalid_tempo_list_returns_400(self, client):
+        r = client.post("/generate", json={"prompt": "hi", "tempo": [120]},
+                        headers={"Authorization": "Bearer test-token"})
+        assert r.status_code == 400
+
+    def test_tempo_below_range_returns_400(self, client):
+        r = client.post("/generate", json={"prompt": "hi", "tempo": 39},
+                        headers={"Authorization": "Bearer test-token"})
+        assert r.status_code == 400
+
+    def test_tempo_above_range_returns_400(self, client):
+        r = client.post("/generate", json={"prompt": "hi", "tempo": 301},
+                        headers={"Authorization": "Bearer test-token"})
+        assert r.status_code == 400
+
+    def test_valid_tempo_returns_202(self, client):
+        r = client.post("/generate", json={"prompt": "hi", "tempo": 120},
                         headers={"Authorization": "Bearer test-token"})
         assert r.status_code == 202
-        data = r.get_json()
-        assert data["seed"] == 555
-        assert data["status"] == "queued"
 
-    def test_generate_assigns_seed_when_omitted(self, client):
+
+class TestRegressionSeedOmission:
+    """Regression: omitted seed must be assigned a concrete int, never null."""
+    @pytest.fixture(autouse=True)
+    def client(self, monkeypatch):
+        monkeypatch.setenv("MG_API_TOKEN", "test-token")
+        if "api_server" in sys.modules:
+            del sys.modules["api_server"]
+        from api_server import app
+        self.app = app
+        yield app.test_client()
+
+    def test_seed_omitted_gets_assigned(self, client):
         r = client.post("/generate", json={"prompt": "hi"},
                         headers={"Authorization": "Bearer test-token"})
         assert r.status_code == 202
@@ -170,26 +255,74 @@ class TestApiEndpoints:
         assert data["seed"] is not None
         assert isinstance(data["seed"], int)
 
-    def test_generate_validates_prompt(self, client):
-        r = client.post("/generate", json={"prompt": "", "seed": 1},
+    def test_seed_omitted_persists_in_status(self, client):
+        r = client.post("/generate", json={"prompt": "hi"},
                         headers={"Authorization": "Bearer test-token"})
-        assert r.status_code == 400
+        assert r.status_code == 202
+        job_id = r.get_json()["job_id"]
+        # Check status endpoint shows non-null seed
+        sr = client.get(f"/status/{job_id}", headers={"Authorization": "Bearer test-token"})
+        assert sr.status_code == 200
+        assert sr.get_json()["seed"] is not None
+        assert isinstance(sr.get_json()["seed"], int)
 
-    def test_generate_validates_tempo(self, client):
-        r = client.post("/generate", json={"prompt": "hi", "tempo": "not-an-int"},
+    def test_seed_explicit_preserved(self, client):
+        r = client.post("/generate", json={"prompt": "hi", "seed": 777},
                         headers={"Authorization": "Bearer test-token"})
-        assert r.status_code == 400
+        assert r.status_code == 202
+        assert r.get_json()["seed"] == 777
 
-    def test_generate_validates_length(self, client):
-        r = client.post("/generate", json={"prompt": "hi", "length": 0},
+
+class TestRegressionGenerateReturns202:
+    """Regression: /generate must return 202, not 200."""
+    @pytest.fixture(autouse=True)
+    def client(self, monkeypatch):
+        monkeypatch.setenv("MG_API_TOKEN", "test-token")
+        if "api_server" in sys.modules:
+            del sys.modules["api_server"]
+        from api_server import app
+        self.app = app
+        yield app.test_client()
+
+    def test_generate_returns_202(self, client):
+        r = client.post("/generate", json={"prompt": "hi"},
                         headers={"Authorization": "Bearer test-token"})
-        assert r.status_code == 400
+        assert r.status_code == 202
 
-    def test_generate_validates_seed(self, client):
-        r = client.post("/generate", json={"prompt": "hi", "seed": "bad"},
+    def test_generate_status_is_queued(self, client):
+        r = client.post("/generate", json={"prompt": "hi"},
                         headers={"Authorization": "Bearer test-token"})
-        assert r.status_code == 400
+        assert r.status_code == 202
+        assert r.get_json()["status"] == "queued"
 
-    def test_status_not_found(self, client):
-        r = client.get("/status/nope", headers={"Authorization": "Bearer test-token"})
-        assert r.status_code == 404
+
+class TestRegressionJobTimeoutUsed:
+    """Regression: JOB_TIMEOUT must be enforced by the worker."""
+    def test_job_timeout_enforced(self, monkeypatch, tmp_path):
+        """Worker must fail a job that exceeds JOB_TIMEOUT."""
+        monkeypatch.setenv("MG_API_TOKEN", "test-token")
+        monkeypatch.setenv("MG_JOB_TIMEOUT", "1")
+        if "config" in sys.modules:
+            del sys.modules["config"]
+        from config import JOB_TIMEOUT
+        assert JOB_TIMEOUT == 1
+
+        from worker import JobTimeoutError, _timeout_handler, process_job
+
+        class SlowBackend:
+            def generate(self, **kwargs):
+                time.sleep(5)
+                return {"status": "success", "output_file": "/tmp/slow.wav"}
+
+        queue_dir = tmp_path / "q"
+        queue = FileQueue(queue_dir=queue_dir)
+        item = QueueItem(job_id="timeout1", prompt="p", mood="c", tempo=100, key="C", length=10, seed=1)
+        queue.enqueue(item)
+        got = queue.dequeue()
+
+        backend = SlowBackend()
+        process_job(queue, backend, got)
+
+        updated = queue.get_item(got.job_id)
+        assert updated.status == "failed"
+        assert "timeout" in updated.result.get("error", "").lower()

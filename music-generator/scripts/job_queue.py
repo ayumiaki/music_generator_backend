@@ -113,7 +113,7 @@ class FileQueue(BaseQueue):
 
     def __init__(self, queue_dir=None):
         self.queue_dir = Path(queue_dir) if queue_dir else QUEUE_DIR
-        self.queue_dir.mkdir(exist_ok=True)
+        self.queue_dir.mkdir(parents=True, exist_ok=True)
         self.queue_file = self.queue_dir / "queue.json"  # simple list of job IDs
         self._ensure_queue_file()
 
