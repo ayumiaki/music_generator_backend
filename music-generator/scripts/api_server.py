@@ -52,16 +52,23 @@ def _require_auth():
 def health():
     backend_type = "synth" if BACKEND_TYPE == "synth" else "mock"
     queue_type = "redis" if QUEUE_TYPE == "redis" else "file"
+    depth = queue.depth()
+    # depth can be int (FileQueue) or dict (RedisQueue)
+    depth_val = depth if isinstance(depth, int) else depth.get("total_active", 0)
     return jsonify({
         "status": "ok",
         "queue": queue_type,
         "backend": backend_type,
-        "queue_depth": queue.depth(),
+        "queue_depth": depth_val,
     })
 
 @app.route('/queue/status', methods=['GET'])
 def queue_status():
     """Return queue metrics for monitoring."""
+    # Use get_metrics() if available (RedisQueue), else fall back to counting
+    if hasattr(queue, 'get_metrics'):
+        metrics = queue.get_metrics()
+        return jsonify(metrics)
     items = queue.list_items(limit=200)
     pending = sum(1 for i in items if i.status == "pending")
     processing = sum(1 for i in items if i.status == "processing")

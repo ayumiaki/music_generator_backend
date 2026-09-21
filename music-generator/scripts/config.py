@@ -16,7 +16,12 @@ QUEUE_DIR = Path(os.getenv("MG_QUEUE_DIR", BASE_DIR / "queue"))
 REDIS_HOST = os.getenv("MG_REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("MG_REDIS_PORT", 6379))
 REDIS_DB = int(os.getenv("MG_REDIS_DB", 0))
-REDIS_QUEUE_KEY = os.getenv("MG_REDIS_QUEUE_KEY", "music_gen:queue")
+REDIS_QUEUE_KEY = os.getenv("MG_REDIS_QUEUE_KEY", "music_gen:jobs")
+REDIS_CONSUMER_GROUP = os.getenv("MG_REDIS_CONSUMER_GROUP", "renderers")
+REDIS_DEAD_LETTER_KEY = "music_gen:jobs:dead"
+MAX_RETRIES = int(os.getenv("MG_MAX_RETRIES", 3))
+WORKER_TIMEOUT = int(os.getenv("MG_WORKER_TIMEOUT", 300))  # seconds before XAUTOCLAIM
+CLAIM_BATCH_SIZE = int(os.getenv("MG_CLAIM_BATCH_SIZE", 1))
 
 # Backend settings
 BACKEND_TYPE = os.getenv("MG_BACKEND_TYPE", "mock")  # mock or real (future)
