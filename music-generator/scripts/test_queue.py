@@ -19,6 +19,7 @@ import shutil
 from pathlib import Path
 from concurrent import futures
 from threading import Thread
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -452,7 +453,228 @@ class TestRedisQueueStreams(unittest.TestCase):
         requeue = self.queue.dequeue(worker_id="w-final", block_ms=100)
         if requeue:
             self.assertNotEqual(requeue.job_id, job_id,
-                                "Dead job should not be dequeued")
+                                "Dead job should not be requeued")
+
+
+class TestRedisRecoveryIntegration(unittest.TestCase):
+    """Redis-specific recovery integration: proves XAUTOCLAIM + XACK + XPENDING=0.
+
+    Exercises the actual Redis recovery path (consumer-group PEL, idle timeout,
+    XAUTOCLAIM to a different consumer, _pending_acks tracking, XACK on completion,
+    WAV artifact on disk) — not the FileQueue file-scan model.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            q = RedisQueue()
+            q.client.ping()
+            cls.queue = q
+        except Exception as e:
+            raise unittest.SkipTest(f"Redis unavailable: {e}")
+
+    def setUp(self):
+        self.queue.client.delete(self.queue.stream_key)
+        self.queue.client.delete(self.queue.dead_key)
+        self.queue._ensure_consumer_group()
+        # Reset in-memory state between tests
+        self.queue._pending_acks = {}
+
+    @mock.patch("job_queue.WORKER_TIMEOUT", 1)  # 1s idle for fast test
+    def test_redis_worker_death_recovery_full_chain(self):
+        """Full Redis recovery chain: XPENDING → XAUTOCLAIM → XACK → XPENDING=0.
+
+        1. Consumer A dequeues (XREADGROUP) → PEL entry owned by consumer-A
+        2. Consumer A dies (no ACK)
+        3. Idle timeout elapses
+        4. Consumer B calls recover() → XAUTOCLAIM → _claim_entry (attempt=2)
+        5. Consumer B renders + completes → XACK
+        6. Verify XPENDING=0, one valid WAV, _pending_acks empty
+        """
+        from backends.mock_backend import MockBackend
+        from worker import process_job
+        from render_io import temp_path as _tmp, final_path as _final
+
+        output_dir = Path(tempfile.mkdtemp())
+        backend_b = MockBackend(output_dir=str(output_dir))
+
+        # 1. Enqueue
+        item = QueueItem(prompt="recovery test", mood="calm", tempo=120,
+                         key="C", length=1, seed=42)
+        job_id = self.queue.enqueue(item)
+
+        # 2. Consumer A dequeues via XREADGROUP → PEL entry owned by "consumer-A"
+        claimed = self.queue.dequeue(worker_id="consumer-A", block_ms=100)
+        self.assertIsNotNone(claimed, "Consumer A should get the job")
+        self.assertEqual(claimed.job_id, job_id)
+        self.assertEqual(claimed.status, "processing")
+        self.assertEqual(claimed.worker_id, "consumer-A")
+        self.assertEqual(claimed.attempt, 1)
+
+        # 3. Consumer A dies — verify XPENDING shows 1 entry owned by "consumer-A"
+        pending_info = self.queue.client.xpending(
+            self.queue.stream_key, self.queue.group_name
+        )
+        self.assertEqual(pending_info["pending"], 1,
+                         "XPENDING should show 1 pending entry")
+
+        # Verify the pending entry is owned by consumer-A
+        pending_range = self.queue.client.xpending_range(
+            self.queue.stream_key, self.queue.group_name,
+            min="-", max="+", count=10
+        )
+        self.assertEqual(len(pending_range), 1)
+        self.assertEqual(pending_range[0]["consumer"], b"consumer-A")
+        original_entry_id = pending_range[0]["message_id"]
+
+        # 4. Wait for idle timeout (WORKER_TIMEOUT=1s, sleep 2s)
+        time.sleep(2.1)
+
+        # 5. Consumer B calls recover() — XAUTOCLAIM from consumer-A to recovery-worker
+        recovered = self.queue.recover(output_dir=str(output_dir))
+        self.assertEqual(len(recovered), 1, "recover() should return 1 item")
+        self.assertEqual(recovered[0].job_id, job_id)
+
+        # Verify attempt incremented to 2, worker_id changed to "recovery-worker"
+        after_recover = self.queue.get_item(job_id)
+        self.assertIsNotNone(after_recover)
+        self.assertEqual(after_recover.status, "processing")
+        self.assertEqual(after_recover.attempt, 2,
+                         "attempt must be 2 after recovery (was 1)")
+        self.assertEqual(after_recover.worker_id, "recovery-worker",
+                         "worker_id should be 'recovery-worker' after XAUTOCLAIM")
+
+        # Verify _pending_acks maps job_id → claimed entry_id
+        self.assertIn(job_id, self.queue._pending_acks,
+                      "_pending_acks must track the claimed entry_id for XACK")
+        ack_entry_id = self.queue._pending_acks[job_id]
+        self.assertEqual(ack_entry_id, original_entry_id.decode()
+                         if isinstance(original_entry_id, bytes)
+                         else original_entry_id,
+                         "_pending_acks entry_id must match the XAUTOCLAIM'd entry")
+
+        # 6. Consumer B renders via process_job (uses temp + atomic rename)
+        process_job(self.queue, backend_b, after_recover, worker_id="recovery-worker")
+
+        # 7. Verify completion
+        final = self.queue.get_item(job_id)
+        self.assertIsNotNone(final)
+        self.assertEqual(final.status, "completed")
+        self.assertIsNotNone(final.completed_at)
+
+        # 8. Verify XACK happened — XPENDING should be 0
+        pending_after = self.queue.client.xpending(
+            self.queue.stream_key, self.queue.group_name
+        )
+        self.assertEqual(pending_after["pending"], 0,
+                         "XPENDING must be 0 after XACK on completion")
+
+        # 9. Verify _pending_acks was consumed
+        self.assertNotIn(job_id, self.queue._pending_acks,
+                         "_pending_acks entry must be removed after XACK")
+
+        # 10. Verify one valid WAV artifact exists at the final path
+        wav_files = list(output_dir.glob("*.wav"))
+        self.assertEqual(len(wav_files), 1,
+                         f"Exactly 1 WAV should exist, got {wav_files}")
+
+        wav_path = wav_files[0]
+        self.assertEqual(wav_path.name, f"{job_id}.wav",
+                         "WAV file should be named <job_id>.wav, not a temp file")
+        self.assertGreater(wav_path.stat().st_size, 0, "WAV file must not be empty")
+
+        # Verify valid WAV header
+        with open(wav_path, "rb") as f:
+            header = f.read(12)
+        self.assertEqual(header[:4], b"RIFF", "WAV must start with RIFF")
+        self.assertEqual(header[8:12], b"WAVE", "WAV must have WAVE marker")
+
+        # 11. No temp files left in output_dir
+        tmp_files = list(output_dir.glob(".tmp.*"))
+        self.assertEqual(len(tmp_files), 0,
+                         f"No temp files should remain, got {tmp_files}")
+
+        # 12. Verify artifact path in result matches the actual file
+        output_file = final.result.get("output_file")
+        self.assertIsNotNone(output_file, "result should contain output_file")
+        self.assertEqual(Path(output_file).resolve(), wav_path.resolve(),
+                         "result output_file must point to the actual WAV")
+
+    @mock.patch("job_queue.WORKER_TIMEOUT", 1)
+    def test_redis_multiple_concurrent_recoveries(self):
+        """Three consumers each own one entry; all die; all three are recovered."""
+        output_dir = Path(tempfile.mkdtemp())
+
+        job_ids = []
+        consumers = ["consumer-X", "consumer-Y", "consumer-Z"]
+
+        for i, consumer in enumerate(consumers):
+            item = QueueItem(prompt=f"multi {i}", mood="calm", tempo=120,
+                             key="C", length=1, seed=i)
+            jid = self.queue.enqueue(item)
+            job_ids.append(jid)
+            claimed = self.queue.dequeue(worker_id=consumer, block_ms=100)
+            self.assertIsNotNone(claimed)
+            self.assertEqual(claimed.attempt, 1)
+            self.assertEqual(claimed.worker_id, consumer)
+
+        # All three pending
+        pending_info = self.queue.client.xpending(
+            self.queue.stream_key, self.queue.group_name
+        )
+        self.assertEqual(pending_info["pending"], 3)
+
+        # Wait for idle timeout
+        time.sleep(2.1)
+
+        # Recover all
+        recovered = self.queue.recover(output_dir=str(output_dir))
+        self.assertEqual(len(recovered), 3)
+
+        # Verify all three have attempt=2 and are owned by recovery-worker
+        recovered_ids = set()
+        for r in recovered:
+            self.assertEqual(r.attempt, 2)
+            self.assertEqual(r.worker_id, "recovery-worker")
+            recovered_ids.add(r.job_id)
+        self.assertEqual(recovered_ids, set(job_ids))
+
+    @mock.patch("job_queue.WORKER_TIMEOUT", 1)
+    def test_redis_recovery_with_mock_backend_produces_valid_artifact(self):
+        """After recovery, process_job produces a valid WAV artifact on disk."""
+        from backends.mock_backend import MockBackend
+        from worker import process_job
+
+        output_dir = Path(tempfile.mkdtemp())
+        backend = MockBackend(output_dir=str(output_dir))
+
+        job_id = self.queue.enqueue(
+            QueueItem(prompt="artifact test", mood="calm", tempo=120,
+                      key="C", length=1, seed=7)
+        )
+        self.queue.dequeue(worker_id="dead-producer", block_ms=100)
+        time.sleep(2.1)
+
+        recovered = self.queue.recover(output_dir=str(output_dir))
+        self.assertEqual(len(recovered), 1)
+
+        item = self.queue.get_item(job_id)
+        process_job(self.queue, backend, item, worker_id="recovery-worker")
+
+        # Artifact exists and is valid
+        wav = output_dir / f"{job_id}.wav"
+        self.assertTrue(wav.exists(), f"WAV should exist at {wav}")
+
+        with open(wav, "rb") as f:
+            data = f.read()
+        self.assertGreater(len(data), 44, "WAV must have header + data")
+        self.assertTrue(data[:4] == b"RIFF" and data[8:12] == b"WAVE",
+                        "WAV header must be valid")
+
+        # Queue state
+        final = self.queue.get_item(job_id)
+        self.assertEqual(final.status, "completed")
+        self.assertEqual(final.attempt, 2)
 
 
 class TestGetQueue(unittest.TestCase):
