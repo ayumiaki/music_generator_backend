@@ -7,7 +7,9 @@ and updates job status.
 import signal
 import time
 import sys
+import os
 from pathlib import Path
+from typing import Optional
 
 # Add scripts directory to path
 SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -39,11 +41,10 @@ def get_backend() -> BaseBackend:
         raise NotImplementedError(f"Backend type '{BACKEND_TYPE}' not implemented")
 
 
-def process_job(queue, backend, item: QueueItem) -> None:
+def process_job(queue, backend, item: QueueItem, worker_id: Optional[str] = None) -> None:
     """Process a single job."""
     print(f"Processing job {item.job_id}: {item.prompt[:50]}...")
-    item.status = "processing"
-    queue.update_item(item)
+    # Note: item.status is already "processing" from dequeue()
 
     # Install alarm-based timeout before calling backend
     old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
@@ -60,18 +61,18 @@ def process_job(queue, backend, item: QueueItem) -> None:
         )
         signal.alarm(0)  # cancel alarm on success
         if result.get("status") == "success":
-            queue.complete(item, result)
+            queue.complete(item, result, worker_id=worker_id)
             print(f"Job {item.job_id} completed successfully")
         else:
-            queue.fail(item, result.get("error", "Backend returned failure"))
+            queue.fail(item, result.get("error", "Backend returned failure"), worker_id=worker_id)
             print(f"Job {item.job_id} failed: {result.get('error')}")
     except JobTimeoutError:
         signal.alarm(0)
-        queue.fail(item, f"Job exceeded timeout of {JOB_TIMEOUT}s")
+        queue.fail(item, f"Job exceeded timeout of {JOB_TIMEOUT}s", worker_id=worker_id)
         print(f"Job {item.job_id} timed out after {JOB_TIMEOUT}s")
     except Exception as e:
         signal.alarm(0)
-        queue.fail(item, f"Worker exception: {str(e)}")
+        queue.fail(item, f"Worker exception: {str(e)}", worker_id=worker_id)
         print(f"Job {item.job_id} failed with exception: {e}")
     finally:
         # Restore previous alarm state
@@ -90,13 +91,14 @@ def main():
 
     queue = get_queue()
     backend = get_backend()
+    worker_id = f"worker-{os.getpid()}"
 
     # Recover any jobs stuck in processing state after a crash
     recovered = queue.recover()
     if recovered:
         print(f"Recovered {len(recovered)} job(s) from previous crash")
         for item in recovered:
-            process_job(queue, backend, item)
+            process_job(queue, backend, item, worker_id=worker_id)
 
     def signal_handler(sig, frame):
         print("\nShutting down worker...")
@@ -107,11 +109,11 @@ def main():
 
     while True:
         try:
-            item = queue.dequeue()
+            item = queue.dequeue(worker_id=worker_id)
             if item is None:
                 time.sleep(POLL_INTERVAL)
                 continue
-            process_job(queue, backend, item)
+            process_job(queue, backend, item, worker_id=worker_id)
         except Exception as e:
             print(f"Worker error: {e}")
             time.sleep(POLL_INTERVAL)

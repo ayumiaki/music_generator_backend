@@ -19,11 +19,11 @@ from flask import Flask, request, jsonify, send_file
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from config import OUTPUT_DIR, QUEUE_DIR, HOST, PORT, MG_API_TOKEN, BACKEND_TYPE
-from job_queue import FileQueue, QueueItem
+from config import OUTPUT_DIR, QUEUE_DIR, HOST, PORT, MG_API_TOKEN, BACKEND_TYPE, QUEUE_TYPE
+from job_queue import get_queue, QueueItem
 
 app = Flask(__name__)
-queue = FileQueue()
+queue = get_queue()
 
 if BACKEND_TYPE == "synth":
     from backends.synth_backend import SynthBackend
@@ -51,7 +51,31 @@ def _require_auth():
 @app.route('/health', methods=['GET'])
 def health():
     backend_type = "synth" if BACKEND_TYPE == "synth" else "mock"
-    return jsonify({"status": "ok", "queue": "file", "backend": backend_type})
+    queue_type = "redis" if QUEUE_TYPE == "redis" else "file"
+    return jsonify({
+        "status": "ok",
+        "queue": queue_type,
+        "backend": backend_type,
+        "queue_depth": queue.depth(),
+    })
+
+@app.route('/queue/status', methods=['GET'])
+def queue_status():
+    """Return queue metrics for monitoring."""
+    items = queue.list_items(limit=200)
+    pending = sum(1 for i in items if i.status == "pending")
+    processing = sum(1 for i in items if i.status == "processing")
+    completed = sum(1 for i in items if i.status == "completed")
+    failed = sum(1 for i in items if i.status == "failed")
+    return jsonify({
+        "queue_type": "redis" if QUEUE_TYPE == "redis" else "file",
+        "depth": queue.depth(),
+        "pending": pending,
+        "processing": processing,
+        "completed": completed,
+        "failed": failed,
+        "total_tracked": len(items),
+    })
 
 def _validate_int(value, field_name, min_val=None, max_val=None):
     """Validate and convert a value to int, returning (error_dict, status_code) or (None, int_value)."""
@@ -121,7 +145,8 @@ def generate():
         seed=seed,
         status='pending',
         result={},
-        created_at=created_at
+        created_at=created_at,
+        queued_at=created_at,
     )
 
     queue.enqueue(item)
