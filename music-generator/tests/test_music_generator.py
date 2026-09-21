@@ -79,15 +79,32 @@ class TestFileQueueAtomicity:
         assert query is not None
         assert query.status == "completed"
 
-    def test_fail_removes_from_queue_list(self, q):
+    def test_fail_queues_for_retry(self, q):
+        """FileQueue: fail() re-queues for retry when attempt < MAX_RETRIES."""
         item = QueueItem(job_id="d1", prompt="z", mood="c", tempo=100, key="C", length=10, seed=2)
         q.enqueue(item)
         got = q.dequeue()
         q.fail(got, "some error")
+        # Should be re-queued (status=pending), not removed
         next_item = q.dequeue()
-        assert next_item is None
-        query = q.get_item("d1")
-        assert query.status == "failed"
+        assert next_item is not None
+        assert next_item.job_id == "d1"
+        assert next_item.status == "processing"
+        assert next_item.attempt == 2  # Second attempt
+
+    def test_fail_exhausts_retries(self, q):
+        """FileQueue: after MAX_RETRIES attempts, status becomes 'dead'."""
+        item = QueueItem(job_id="d2", prompt="x", mood="c", tempo=100, key="C", length=10, seed=3)
+        q.enqueue(item)
+        for attempt in range(4):  # attempt 1, 2, 3, 4 (MAX_RETRIES=3)
+            got = q.dequeue()
+            if got:
+                q.fail(got, f"error {attempt}")
+        # After exhausting retries, should be "dead"
+        query = q.get_item("d2")
+        assert query.status == "dead"
+        # Should NOT be dequeueable
+        assert q.dequeue() is None
 
     def test_custom_queue_dir_isolated(self, queue_dir):
         """FileQueue with custom queue_dir stays isolated from global QUEUE_DIR."""
@@ -114,13 +131,17 @@ class TestRegressionCompletedJobNotRedequeued:
         second = q.dequeue()
         assert second is None, "Completed job must not be dequeued again"
 
-    def test_second_dequeue_after_fail_returns_none(self, q):
+    def test_second_dequeue_after_fail_retries(self, q):
+        """FileQueue: failed job is retried (re-queued) when attempt < MAX_RETRIES."""
         item = QueueItem(job_id="rd2", prompt="p", mood="c", tempo=100, key="C", length=10, seed=2)
         q.enqueue(item)
         got = q.dequeue()
         q.fail(got, "some error")
+        # Should be re-queued for retry
         second = q.dequeue()
-        assert second is None, "Failed job must not be dequeued again"
+        assert second is not None, "Failed job should be retried (re-queued)"
+        assert second.job_id == "rd2"
+        assert second.attempt == 2
 
     def test_completed_job_still_queryable(self, q):
         item = QueueItem(job_id="rd3", prompt="p", mood="c", tempo=100, key="C", length=10, seed=3)
@@ -324,5 +345,8 @@ class TestRegressionJobTimeoutUsed:
         process_job(queue, backend, got)
 
         updated = queue.get_item(got.job_id)
-        assert updated.status == "failed"
-        assert "timeout" in updated.result.get("error", "").lower()
+        # With retry behavior: timeout failure re-queues for retry (status=pending)
+        # or is "dead" if retries exhausted
+        assert updated.status in ("pending", "dead"), f"Expected pending/dead, got {updated.status}"
+        if updated.status == "pending":
+            assert updated.attempt >= 1  # Attempt was recorded

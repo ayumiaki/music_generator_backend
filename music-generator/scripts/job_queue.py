@@ -168,8 +168,8 @@ class BaseQueue(ABC):
         pass
 
     @abstractmethod
-    def depth(self) -> Any:
-        """Return the number of pending+processing jobs in the queue."""
+    def depth(self) -> Dict[str, int]:
+        """Return queue depth: pending + processing counts."""
         pass
 
     def complete(self, item: QueueItem, result: dict = None, worker_id: str = None) -> None:
@@ -255,39 +255,69 @@ class FileQueue(BaseQueue):
         return item.job_id
 
     def dequeue(self, worker_id: str = None) -> Optional[QueueItem]:
+        """Claim the first pending job atomically: remove from pending list + mark processing."""
         with self._locked() as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             try:
                 ids = self._read_queue_ids()
-                if not ids:
-                    return None
-                job_id = ids[0]
-                job_file = self._job_file_path(job_id)
-                if job_file.exists():
-                    data = json.loads(job_file.read_text())
-                    item = QueueItem.from_dict(data)
-                    item.status = "processing"
-                    item.processing_at = time.time()
-                    item.worker_id = worker_id
-                    self._atomic_write(job_file, json.dumps(item.to_dict(), indent=2))
-                    return item
-                else:
-                    # Orphaned ID — remove and skip
-                    ids.pop(0)
-                    self._write_queue_ids(ids)
-                    return None
+                while ids:
+                    job_id = ids.pop(0)
+                    job_file = self._job_file_path(job_id)
+                    if job_file.exists():
+                        data = json.loads(job_file.read_text())
+                        item = QueueItem.from_dict(data)
+                        if item.status == "pending":
+                            item.status = "processing"
+                            item.processing_at = time.time()
+                            item.worker_id = worker_id
+                            item.attempt += 1
+                            self._atomic_write(job_file, json.dumps(item.to_dict(), indent=2))
+                            self._write_queue_ids(ids)
+                            return item
+                        # else: stale entry (completed/dead), skip
+                    # else: orphaned ID, skip
+                self._write_queue_ids(ids)
+                return None
             finally:
                 fcntl.flock(lock, fcntl.LOCK_UN)
 
     def _persist_completion(self, item: QueueItem) -> None:
         job_file = self._job_file_path(item.job_id)
         self._atomic_write(job_file, json.dumps(item.to_dict(), indent=2))
-        with self._locked() as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            try:
-                self._remove_from_queue_list(item.job_id)
-            finally:
-                fcntl.flock(lock, fcntl.LOCK_UN)
+
+    def complete(self, item: QueueItem, result: dict = None, worker_id: str = None) -> None:
+        """Mark job as completed."""
+        item.status = "completed"
+        item.completed_at = time.time()
+        if worker_id:
+            item.worker_id = worker_id
+        if result is not None:
+            item.result = result
+        self._persist_completion(item)
+
+    def fail(self, item: QueueItem, error: str, worker_id: str = None) -> None:
+        """Mark job as failed. Retry or move to dead status."""
+        item.error = error
+        item.failed_at = time.time()
+        if worker_id:
+            item.worker_id = worker_id
+
+        if item.attempt < MAX_RETRIES:
+            item.status = "pending"
+            item.processing_at = None
+            self._atomic_write(self._job_file_path(item.job_id), json.dumps(item.to_dict(), indent=2))
+            with self._locked() as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                try:
+                    ids = self._read_queue_ids()
+                    if item.job_id not in ids:
+                        ids.append(item.job_id)
+                    self._write_queue_ids(ids)
+                finally:
+                    fcntl.flock(lock, fcntl.LOCK_UN)
+        else:
+            item.status = "dead"
+            self._persist_completion(item)
 
     def _remove_from_queue_list(self, job_id: str) -> None:
         ids = self._read_queue_ids()
@@ -296,27 +326,34 @@ class FileQueue(BaseQueue):
             self._write_queue_ids(ids)
 
     def recover(self) -> List[QueueItem]:
-        """Pick up any jobs stuck in 'processing' state after a crash."""
+        """Recover jobs stuck in 'processing' state after a crash.
+
+        Scans all job files (not just queue list) since claimed jobs
+        are removed from the pending list.
+        """
         recovered = []
         with self._locked() as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             try:
                 ids = self._read_queue_ids()
-                for job_id in list(ids):
-                    job_file = self._job_file_path(job_id)
-                    if job_file.exists():
-                        try:
-                            data = json.loads(job_file.read_text())
-                            item = QueueItem.from_dict(data)
-                            if item.status == "processing":
-                                item.status = "pending"
-                                item.processing_at = None
-                                item.worker_id = None
-                                self._atomic_write(job_file, json.dumps(item.to_dict(), indent=2))
-                                recovered.append(item)
-                        except (json.JSONDecodeError, KeyError):
-                            # Corrupt file — skip
-                            pass
+                for job_file in self.queue_dir.glob("*.json"):
+                    if job_file.name in ("queue.json",):
+                        continue
+                    job_id = job_file.stem
+                    try:
+                        data = json.loads(job_file.read_text())
+                        item = QueueItem.from_dict(data)
+                        if item.status == "processing":
+                            item.status = "pending"
+                            item.processing_at = None
+                            item.worker_id = None
+                            self._atomic_write(job_file, json.dumps(item.to_dict(), indent=2))
+                            if job_id not in ids:
+                                ids.append(job_id)
+                            recovered.append(item)
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+                self._write_queue_ids(ids)
             finally:
                 fcntl.flock(lock, fcntl.LOCK_UN)
         return recovered
@@ -337,12 +374,19 @@ class FileQueue(BaseQueue):
         self._atomic_write(job_file, json.dumps(item.to_dict(), indent=2))
 
     def list_items(self, limit: int = 100) -> List[QueueItem]:
-        ids = self._read_queue_ids()
+        """List all jobs by scanning job files (not just queue list)."""
         items = []
-        for job_id in ids[:limit]:  # FIFO order
-            item = self.get_item(job_id)
-            if item:
+        for job_file in self.queue_dir.glob("*.json"):
+            if job_file.name == "queue.json":
+                continue
+            try:
+                data = json.loads(job_file.read_text())
+                item = QueueItem.from_dict(data)
                 items.append(item)
+            except (json.JSONDecodeError, KeyError):
+                pass
+            if len(items) >= limit:
+                break
         return items
 
     def remove_item(self, job_id: str) -> bool:
@@ -361,8 +405,27 @@ class FileQueue(BaseQueue):
             return True
         return False
 
-    def depth(self) -> int:
-        return len(self._read_queue_ids())
+    def depth(self) -> Dict[str, int]:
+        """Return queue depth: pending + processing counts."""
+        pending = 0
+        processing = 0
+        for job_file in self.queue_dir.glob("*.json"):
+            if job_file.name == "queue.json":
+                continue
+            try:
+                data = json.loads(job_file.read_text())
+                status = data.get("status", "")
+                if status == "pending":
+                    pending += 1
+                elif status == "processing":
+                    processing += 1
+            except (json.JSONDecodeError, KeyError):
+                pass
+        return {
+            "pending": pending,
+            "processing": processing,
+            "total_active": pending + processing,
+        }
 
 
 # Try to import redis

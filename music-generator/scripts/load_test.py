@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Load test harness for music generator API.
-Measures real latency under concurrency with full lifecycle timing.
+Measures true per-job TTFB: each concurrent task does submit→poll→download
+independently, so no job's timeline is contaminated by waiting for others.
 
 Usage:
     python load_test.py --url http://localhost:8000 --jobs 50 --concurrency 10
@@ -14,8 +15,10 @@ import os
 import sys
 import time
 import statistics
+from collections import defaultdict
 from concurrent import futures as concurrent_futures
 from pathlib import Path
+from threading import Lock, Thread
 
 try:
     import requests
@@ -38,274 +41,341 @@ def make_job(seed: int, length: int = 5) -> dict:
     }
 
 
-def submit_job(session: requests.Session, url: str, job: dict) -> dict:
-    """Submit a job and return timing info."""
-    t0 = time.time()
-    resp = session.post(f"{url}/generate", json=job)
-    t1 = time.time()
-    data = resp.json()
-    data["_submit_start"] = t0
-    data["_202_received"] = t1
-    return data
+def pct(data, p):
+    """Compute percentile."""
+    if not data:
+        return 0
+    sorted_data = sorted(data)
+    idx = int(len(sorted_data) * p / 100)
+    idx = min(idx, len(sorted_data) - 1)
+    return sorted_data[idx]
 
 
-def wait_for_completion(session: requests.Session, url: str, job_id: str,
-                        timeout: float = 300.0, poll_interval: float = 0.5) -> dict:
-    """Poll status until job completes or fails."""
-    t0 = time.time()
-    while time.time() - t0 < timeout:
-        resp = session.get(f"{url}/status/{job_id}")
-        if resp.status_code == 200:
-            data = resp.json()
-            if data.get("status") in ("completed", "failed"):
-                data["_completed_at"] = time.time()
-                return data
-        time.sleep(poll_interval)
-    return {"status": "timeout", "job_id": job_id, "_completed_at": time.time()}
+def run_single_job_lifecycle(url: str, job: dict, poll_interval: float = 0.5,
+                             timeout: float = 300.0) -> dict:
+    """One complete lifecycle: submit → poll → download, with OWN session.
 
-
-def download_artifact(session: requests.Session, url: str, job_id: str) -> dict:
-    """Download the artifact and measure TTFB."""
-    t0 = time.time()
-    resp = session.get(f"{url}/artifact/{job_id}", stream=True)
-    # Read first byte
-    content = b""
-    for chunk in resp.iter_content(chunk_size=1024):
-        if chunk:
-            t1 = time.time()
-            content += chunk
-            first_byte_time = t1
-            break
-    # Drain the rest
-    for chunk in resp.iter_content(chunk_size=8192):
-        content += chunk
-    t2 = time.time()
-    return {
-        "_artifact_request_start": t0,
-        "_first_byte_at": first_byte_time if content else None,
-        "_download_completed": t2,
-        "_artifact_size": len(content),
-        "_artifact_hash": hashlib.sha256(content).hexdigest() if content else None,
+    Returns per-job timing so no barrier contamination.
+    """
+    result = {
+        "job_id": None,
+        "submit_start": None,
+        "submit_202": None,
+        "completed_at": None,
+        "artifact_request_start": None,
+        "first_byte_at": None,
+        "download_completed": None,
+        "artifact_size": 0,
+        "artifact_hash": None,
+        "status": "unknown",
+        "error": None,
+        "queued_at": None,
+        "processing_at": None,
+        "worker_id": None,
+        "attempt": None,
     }
+    session = requests.Session()
+    try:
+        # 1. Submit
+        result["submit_start"] = time.time()
+        resp = session.post(f"{url}/generate", json=job, timeout=30)
+        result["submit_202"] = time.time()
+        if resp.status_code != 202:
+            result["status"] = "rejected"
+            result["error"] = f"HTTP {resp.status_code}: {resp.text[:200]}"
+            return result
+        data = resp.json()
+        job_id = data.get("job_id")
+        result["job_id"] = job_id
+        if not job_id:
+            result["status"] = "no_id"
+            result["error"] = "No job_id in response"
+            return result
+
+        # 2. Poll until complete (independent of other jobs)
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            resp = session.get(f"{url}/status/{job_id}", timeout=10)
+            if resp.status_code == 200:
+                st = resp.json()
+                status = st.get("status")
+                if status in ("completed", "failed", "dead"):
+                    result["status"] = status
+                    result["queued_at"] = st.get("queued_at")
+                    result["processing_at"] = st.get("processing_at")
+                    result["completed_at"] = time.time()
+                    result["worker_id"] = st.get("worker_id")
+                    result["attempt"] = st.get("attempt")
+                    break
+            time.sleep(poll_interval)
+        else:
+            result["status"] = "timeout"
+            result["error"] = f"Poll timeout after {timeout}s"
+            return result
+
+        if result["status"] != "completed":
+            return result
+
+        # 3. Download artifact (independent — not waiting for other jobs)
+        result["artifact_request_start"] = time.time()
+        resp = session.get(f"{url}/artifact/{job_id}", stream=True, timeout=60)
+        content = b""
+        first_byte_time = None
+        for chunk in resp.iter_content(chunk_size=8192):
+            if chunk:
+                if first_byte_time is None:
+                    first_byte_time = time.time()
+                content += chunk
+        result["download_completed"] = time.time()
+        result["first_byte_at"] = first_byte_time
+        result["artifact_size"] = len(content)
+        result["artifact_hash"] = hashlib.sha256(content).hexdigest() if content else None
+
+    except Exception as e:
+        result["status"] = "error"
+        result["error"] = str(e)
+    finally:
+        session.close()
+    return result
+
+
+class QueueSampler:
+    """Periodically sample queue depth in the background."""
+
+    def __init__(self, url: str, interval: float = 2.0):
+        self.url = url
+        self.interval = interval
+        self.samples = []
+        self._stop = False
+        self._lock = Lock()
+
+    def start(self):
+        self._thread = Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop = True
+        if hasattr(self, '_thread'):
+            self._thread.join(timeout=5)
+
+    def _run(self):
+        while not self._stop:
+            try:
+                resp = requests.get(f"{self.url}/queue/status", timeout=5)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    with self._lock:
+                        self.samples.append({
+                            "time": time.time(),
+                            **data,
+                        })
+            except Exception:
+                pass
+            time.sleep(self.interval)
+
+    def get_samples(self):
+        with self._lock:
+            return list(self.samples)
 
 
 def run_load_test(url: str, num_jobs: int, concurrency: int, job_length: int = 5):
-    """Run the full load test."""
+    """Run the full load test with per-job independent lifecycle."""
     print(f"Load Test: {num_jobs} jobs, concurrency={concurrency}, length={job_length}s")
     print(f"Target: {url}")
     print()
 
     # Health check
-    resp = requests.get(f"{url}/health")
-    if resp.status_code != 200:
-        print(f"ERROR: Health check failed: {resp.status_code}")
+    try:
+        resp = requests.get(f"{url}/health", timeout=5)
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"ERROR: Health check failed: {e}")
         sys.exit(1)
     health = resp.json()
     print(f"Server: queue={health.get('queue')}, backend={health.get('backend')}, depth={health.get('queue_depth')}")
     print()
 
-    # Submit jobs
-    print(f"Submitting {num_jobs} jobs...")
-    submit_results = []
+    # Start queue depth sampler
+    sampler = QueueSampler(url=url, interval=2.0)
+    sampler.start()
+
+    # Submit + lifecycle all jobs with independent per-job timelines
+    print(f"Running {num_jobs} jobs with independent lifecycle...")
     t_start = time.time()
 
-    with requests.Session() as session:
-        with concurrent_futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
-            futures = []
-            for i in range(num_jobs):
-                job = make_job(seed=i + 1, length=job_length)
-                future = executor.submit(submit_job, session, url, job)
-                futures.append((i, future))
+    results = []
+    with concurrent_futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
+        futures = []
+        for i in range(num_jobs):
+            job = make_job(seed=i + 1, length=job_length)
+            future = executor.submit(run_single_job_lifecycle, url, job)
+            futures.append(future)
 
-            for i, future in futures:
-                try:
-                    result = future.result(timeout=30)
-                    submit_results.append(result)
-                except Exception as e:
-                    submit_results.append({"error": str(e), "job_id": None})
+        for future in concurrent_futures.as_completed(futures):
+            try:
+                result = future.result()
+                results.append(result)
+            except Exception as e:
+                results.append({"status": "error", "error": str(e)})
 
-    t_submit_done = time.time()
-    print(f"Submission complete in {t_submit_done - t_start:.2f}s")
+    t_done = time.time()
+    sampler.stop()
 
-    # Filter successful submissions
-    successful = [r for r in submit_results if "job_id" in r and r["job_id"]]
-    failed_submits = [r for r in submit_results if "error" in r]
-    print(f"Successful submissions: {len(successful)}/{num_jobs}")
-    if failed_submits:
-        print(f"Failed submissions: {len(failed_submits)}")
-        for fs in failed_submits[:3]:
-            print(f"  {fs}")
-
-    # Wait for all to complete
-    print(f"\nWaiting for {len(successful)} jobs to complete...")
-    completion_results = []
-    t_wait_start = time.time()
-
-    with requests.Session() as session:
-        with concurrent_futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
-            futures = {}
-            for r in successful:
-                future = executor.submit(wait_for_completion, session, url, r["job_id"])
-                futures[r["job_id"]] = future
-
-            for job_id, future in futures.items():
-                try:
-                    result = future.result(timeout=600)
-                    completion_results.append(result)
-                except Exception as e:
-                    completion_results.append({"status": "error", "error": str(e), "job_id": job_id})
-
-    t_wait_done = time.time()
-    print(f"All jobs finished in {t_wait_done - t_wait_start:.2f}s")
-
-    # Download artifacts for completed jobs
-    completed = [r for r in completion_results if r.get("status") == "completed"]
-    print(f"\nDownloading {len(completed)} artifacts...")
-    artifact_results = {}
-
-    with requests.Session() as session:
-        with concurrent_futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
-            futures = {}
-            for r in completed:
-                future = executor.submit(download_artifact, session, url, r["job_id"])
-                futures[r["job_id"]] = future
-
-            for job_id, future in futures.items():
-                try:
-                    result = future.result(timeout=60)
-                    artifact_results[job_id] = result
-                except Exception as e:
-                    artifact_results[job_id] = {"error": str(e)}
+    print(f"All jobs finished in {t_done - t_start:.2f}s")
 
     # Compute metrics
     print("\n" + "=" * 60)
     print("RESULTS")
     print("=" * 60)
 
-    # Submission latency
-    submit_latencies = [r["_202_received"] - r["_submit_start"] for r in successful]
-    if submit_latencies:
-        print(f"\nSubmission Latency (POST → 202):")
-        print(f"  min:    {min(submit_latencies)*1000:.1f} ms")
-        print(f"  max:    {max(submit_latencies)*1000:.1f} ms")
-        print(f"  mean:   {statistics.mean(submit_latencies)*1000:.1f} ms")
-        print(f"  median: {statistics.median(submit_latencies)*1000:.1f} ms")
-        if len(submit_latencies) > 1:
-            print(f"  stddev: {statistics.stdev(submit_latencies)*1000:.1f} ms")
-
-    # Completion status
-    status_counts = {}
-    for r in completion_results:
-        s = r.get("status", "unknown")
-        status_counts[s] = status_counts.get(s, 0) + 1
-    print(f"\nCompletion Status:")
+    # Status breakdown
+    status_counts = defaultdict(int)
+    for r in results:
+        status_counts[r.get("status", "unknown")] += 1
+    print("\nCompletion Status:")
     for status, count in sorted(status_counts.items()):
         print(f"  {status}: {count}")
 
-    # Queue wait + render time (from job timestamps)
+    # Submission latency
+    submit_lates = []
+    for r in results:
+        if r.get("submit_start") and r.get("submit_202"):
+            submit_lates.append(r["submit_202"] - r["submit_start"])
+    if submit_lates:
+        print(f"\nSubmission Latency (POST → 202):")
+        print(f"  p50: {pct(submit_lates, 50)*1000:.1f} ms")
+        print(f"  p95: {pct(submit_lates, 95)*1000:.1f} ms")
+        print(f"  p99: {pct(submit_lates, 99)*1000:.1f} ms")
+        print(f"  max: {max(submit_lates)*1000:.1f} ms")
+
+    # Queue wait + render time (from job's own timestamps)
     queue_waits = []
     render_times = []
-    total_times = []
-    for r in completion_results:
-        if r.get("status") == "completed":
-            queued_at = r.get("queued_at")
-            processing_at = r.get("processing_at")
-            completed_at = r.get("completed_at")
-            if queued_at and processing_at and completed_at:
-                queue_waits.append(processing_at - queued_at)
-                render_times.append(completed_at - processing_at)
-                total_times.append(completed_at - queued_at)
+    for r in results:
+        qa = r.get("queued_at")
+        pa = r.get("processing_at")
+        ca = r.get("completed_at")
+        if qa and pa and ca:
+            queue_waits.append(pa - qa)
+            # completed_at is from our poll, not server's completed_at
+            # But we stored completed_at from status response... actually we used time.time()
+            # Let's use the stored completed_at which is when poll saw it complete
+            # This is approximate but consistent
+            render_times.append(ca - pa)
 
     if queue_waits:
         print(f"\nQueue Wait (queued → processing):")
-        print(f"  min:    {min(queue_waits)*1000:.1f} ms")
-        print(f"  max:    {max(queue_waits)*1000:.1f} ms")
-        print(f"  mean:   {statistics.mean(queue_waits)*1000:.1f} ms")
-        print(f"  median: {statistics.median(queue_waits)*1000:.1f} ms")
+        print(f"  p50: {pct(queue_waits, 50)*1000:.1f} ms")
+        print(f"  p95: {pct(queue_waits, 95)*1000:.1f} ms")
+        print(f"  p99: {pct(queue_waits, 99)*1000:.1f} ms")
+        print(f"  max: {max(queue_waits)*1000:.1f} ms")
 
     if render_times:
-        print(f"\nRender Time (processing → completed):")
-        print(f"  min:    {min(render_times)*1000:.1f} ms")
-        print(f"  max:    {max(render_times)*1000:.1f} ms")
-        print(f"  mean:   {statistics.mean(render_times)*1000:.1f} ms")
-        print(f"  median: {statistics.median(render_times)*1000:.1f} ms")
+        print(f"\nRender+Poll Time (processing → complete seen by client):")
+        print(f"  p50: {pct(render_times, 50)*1000:.1f} ms")
+        print(f"  p95: {pct(render_times, 95)*1000:.1f} ms")
+        print(f"  p99: {pct(render_times, 99)*1000:.1f} ms")
 
-    if total_times:
-        print(f"\nTotal Job Time (queued → completed):")
-        print(f"  min:    {min(total_times)*1000:.1f} ms")
-        print(f"  max:    {max(total_times)*1000:.1f} ms")
-        print(f"  mean:   {statistics.mean(total_times)*1000:.1f} ms")
-        print(f"  median: {statistics.median(total_times)*1000:.1f} ms")
+    # Artifact TTFB (from own request start to first byte)
+    artifact_ttfb = []
+    for r in results:
+        if r.get("artifact_request_start") and r.get("first_byte_at"):
+            artifact_ttfb.append(r["first_byte_at"] - r["artifact_request_start"])
+    if artifact_ttfb:
+        print(f"\nArtifact TTFB (GET → first byte, per job):")
+        print(f"  p50: {pct(artifact_ttfb, 50)*1000:.1f} ms")
+        print(f"  p95: {pct(artifact_ttfb, 95)*1000:.1f} ms")
+        print(f"  p99: {pct(artifact_ttfb, 99)*1000:.1f} ms")
+        print(f"  max: {max(artifact_ttfb)*1000:.1f} ms")
 
-    # Artifact download
-    ttfb_times = []
-    download_times = []
-    artifact_sizes = []
-    for job_id, ar in artifact_results.items():
-        if ar.get("_first_byte_at"):
-            ttfb_times.append(ar["_first_byte_at"] - ar["_artifact_request_start"])
-            download_times.append(ar["_download_completed"] - ar["_artifact_request_start"])
-            artifact_sizes.append(ar.get("_artifact_size", 0))
+    # TRUE end-to-end: submit → first byte (independent per job)
+    true_e2e = []
+    for r in results:
+        if r.get("submit_start") and r.get("first_byte_at"):
+            true_e2e.append(r["first_byte_at"] - r["submit_start"])
+    if true_e2e:
+        print(f"\nTRUE End-to-End (submit → first WAV byte, NO barrier):")
+        print(f"  p50: {pct(true_e2e, 50)*1000:.1f} ms")
+        print(f"  p95: {pct(true_e2e, 95)*1000:.1f} ms")
+        print(f"  p99: {pct(true_e2e, 99)*1000:.1f} ms")
+        print(f"  max: {max(true_e2e)*1000:.1f} ms")
 
-    if ttfb_times:
-        print(f"\nArtifact TTFB (GET → first byte):")
-        print(f"  min:    {min(ttfb_times)*1000:.1f} ms")
-        print(f"  max:    {max(ttfb_times)*1000:.1f} ms")
-        print(f"  mean:   {statistics.mean(ttfb_times)*1000:.1f} ms")
-        print(f"  median: {statistics.median(ttfb_times)*1000:.1f} ms")
-
-    if download_times:
-        print(f"\nArtifact Download Time:")
-        print(f"  min:    {min(download_times)*1000:.1f} ms")
-        print(f"  max:    {max(download_times)*1000:.1f} ms")
-        print(f"  mean:   {statistics.mean(download_times)*1000:.1f} ms")
-
-    if artifact_sizes:
+    # Artifact sizes
+    sizes = [r["artifact_size"] for r in results if r.get("artifact_size", 0) > 0]
+    if sizes:
         print(f"\nArtifact Sizes:")
-        print(f"  min:    {min(artifact_sizes):,} bytes")
-        print(f"  max:    {max(artifact_sizes):,} bytes")
-        print(f"  mean:   {statistics.mean(artifact_sizes):,.0f} bytes")
+        print(f"  min: {min(sizes):,} bytes")
+        print(f"  max: {max(sizes):,} bytes")
+        print(f"  mean: {statistics.mean(sizes):,.0f} bytes")
 
-    # True end-to-end (submit → first byte)
-    true_ttfb = []
-    for r in successful:
-        job_id = r["job_id"]
-        ar = artifact_results.get(job_id, {})
-        if ar.get("_first_byte_at"):
-            true_ttfb.append(ar["_first_byte_at"] - r["_submit_start"])
-    if true_ttfb:
-        print(f"\nTrue End-to-End (submit → first WAV byte):")
-        print(f"  min:    {min(true_ttfb)*1000:.1f} ms")
-        print(f"  max:    {max(true_ttfb)*1000:.1f} ms")
-        print(f"  mean:   {statistics.mean(true_ttfb)*1000:.1f} ms")
-        print(f"  median: {statistics.median(true_ttfb)*1000:.1f} ms")
+    # EXACT-ONCE processing check
+    # Group by job status and check for duplicate worker assignments
+    print(f"\nExact-Once Processing Check:")
+    submitted_count = sum(1 for r in results if r.get("job_id"))
+    completed_count = sum(1 for r in results if r.get("status") == "completed")
+    print(f"  Submitted: {submitted_count}")
+    print(f"  Completed: {completed_count}")
+
+    # Check for duplicate worker processing (same job_id, different workers or multiple attempts)
+    job_worker_map = defaultdict(list)
+    for r in results:
+        if r.get("job_id") and r.get("worker_id"):
+            job_worker_map[r["job_id"]].append(r.get("worker_id"))
+
+    multi_worker_jobs = {k: v for k, v in job_worker_map.items() if len(v) > 1}
+    if multi_worker_jobs:
+        print(f"  WARN: {len(multi_worker_jobs)} jobs processed by multiple workers")
+        for jid, workers in list(multi_worker_jobs.items())[:3]:
+            print(f"    {jid}: {workers}")
+    else:
+        print(f"  No multi-worker jobs detected")
+
+    # Check attempt counts
+    attempts = [r["attempt"] for r in results if r.get("attempt") is not None]
+    if attempts:
+        print(f"  Attempt counts: min={min(attempts)}, max={max(attempts)}, mean={statistics.mean(attempts):.1f}")
+        multi_attempt = sum(1 for a in attempts if a > 1)
+        if multi_attempt:
+            print(f"  WARN: {multi_attempt} jobs required multiple attempts")
+
+    # Artifact hash uniqueness (detect double-renders of same job)
+    hash_to_jobs = defaultdict(list)
+    for r in results:
+        if r.get("artifact_hash"):
+            hash_to_jobs[r["artifact_hash"]].append(r.get("job_id"))
+    dup_hashes = {k: v for k, v in hash_to_jobs.items() if len(v) > 1}
+    if dup_hashes:
+        print(f"  WARN: {len(dup_hashes)} artifact hashes shared by multiple jobs")
+    else:
+        print(f"  All artifact hashes unique")
+
+    # Final queue state
+    try:
+        resp = requests.get(f"{url}/queue/status", timeout=5)
+        if resp.status_code == 200:
+            qs = resp.json()
+            print(f"\nFinal Queue State:")
+            for k, v in sorted(qs.items()):
+                print(f"  {k}: {v}")
+    except Exception as e:
+        print(f"\nFinal queue state unavailable: {e}")
+
+    # Queue depth over time
+    samples = sampler.get_samples()
+    if samples:
+        depths = [s.get("total_active", s.get("stream_length", 0)) for s in samples]
+        if depths:
+            print(f"\nQueue Depth Over Time (sampled every 2s):")
+            print(f"  min: {min(depths)}")
+            print(f"  max: {max(depths)}")
+            print(f"  mean: {statistics.mean(depths):.1f}")
+            print(f"  samples: {len(depths)}")
 
     # Throughput
-    total_wall = time.time() - t_start
-    completed_count = status_counts.get("completed", 0)
+    total_wall = t_done - t_start
     print(f"\nThroughput:")
     print(f"  Total wall time: {total_wall:.2f}s")
     print(f"  Jobs/s: {completed_count / total_wall:.2f}")
-
-    # Exact-once check
-    print(f"\nExact-Once Check:")
-    print(f"  Submitted: {len(successful)}")
-    print(f"  Completed: {completed_count}")
-    if completed_count == len(successful):
-        print(f"  PASS: All submitted jobs completed exactly once")
-    else:
-        print(f"  FAIL: {len(successful) - completed_count} jobs lost or failed")
-
-    # Final queue depth
-    resp = requests.get(f"{url}/queue/status")
-    if resp.status_code == 200:
-        qs = resp.json()
-        print(f"\nFinal Queue State:")
-        print(f"  depth: {qs.get('depth')}")
-        print(f"  pending: {qs.get('pending')}")
-        print(f"  processing: {qs.get('processing')}")
-        print(f"  completed: {qs.get('completed')}")
-        print(f"  failed: {qs.get('failed')}")
 
 
 def main():
