@@ -51,7 +51,7 @@ class VoiceEngine:
         self._voices: list[ActiveVoice | None] = [None] * polyphony
         self._next_id = 0
         self._rng = np.random.RandomState(seed)
-        self._alloc_order: list[int] = list(range(polyphony))  # deterministic
+        self._alloc_order: list[int] = list(range(polyphony))
 
     def reset(self) -> None:
         self._voices = [None] * self.polyphony
@@ -73,8 +73,9 @@ class VoiceEngine:
                 )
                 return vid
 
-        # Steal oldest (lowest ID)
-        steal_id = self._alloc_order[0]
+        # Steal oldest (lowest ID in alloc order)
+        steal_id = self._alloc_order.pop(0)
+        self._alloc_order.append(steal_id)
         self._voices[steal_id] = ActiveVoice(
             voice_id=steal_id,
             freq=freq,
@@ -102,7 +103,12 @@ class VoiceEngine:
         notes: list[tuple[float, int, float]],
         block_size: int = 48000,
     ) -> np.ndarray:
-        """Render a block of notes (freq, duration_frames, amplitude)."""
+        """Render a block of notes (freq, duration_frames, amplitude).
+
+        Voices are shared across all notes in the block — polyphony and
+        stealing are exercised. Note-off is called after each note's
+        duration, and the release tail is rendered.
+        """
         from .oscillator import WavetableOscillator
         from .envelope import ADSREnvelope
         from .filter import LadderFilter
@@ -131,23 +137,39 @@ class VoiceEngine:
         for freq, duration, amp in notes:
             if duration <= 0:
                 continue
-            voice = self.allocate(freq, amp)
-            if voice is None:
+            voice_id = self.allocate(freq, amp)
+            if voice_id is None:
                 continue
+
             # Render oscillator
             osc_out = osc.render(freq, duration, phase_reset=True, reset_phase=0.0)
+
             # Apply envelope
             env.reset()
             env.note_on()
             env_out = env.render(duration)
+
             # Apply filter
             flt.reset()
-            # Modulate: osc -> env -> filter
             signal = osc_out * env_out * amp
             filtered = flt.render(signal[:duration])
+
             # Mix
             end = min(len(filtered), block_size)
             mixed[:end] += filtered[:end]
+
+            # Note-off and release tail
+            self.note_off(voice_id)
+            release_samples = min(self.config.release_samples, block_size - duration)
+            if release_samples > 0:
+                env.reset()
+                env.note_off()
+                release_out = env.render(release_samples)
+                # Render release tail through filter
+                release_signal = np.zeros(release_samples, dtype=np.float64)
+                release_filtered = flt.render(release_signal)
+                release_end = min(release_samples, block_size - duration)
+                mixed[duration:duration + release_end] += release_filtered[:release_end] * amp
 
         # Prevent clipping
         max_val = np.max(np.abs(mixed)) if len(mixed) > 0 else 1.0

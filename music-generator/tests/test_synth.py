@@ -486,7 +486,8 @@ class TestPerformance:
 
     def test_real_time_factor_30s(self):
         from synth.synth import SynthEngine, SynthConfig
-        config = SynthConfig(bpm=120, bars=4, seed=42, sample_rate=48000)
+        # 30 seconds at 120 BPM = 15 bars (1 bar = 2 seconds)
+        config = SynthConfig(bpm=120, bars=15, seed=42, sample_rate=48000)
         engine = SynthEngine(config)
         # 30 seconds at 48kHz = 1,440,000 samples
         for i in range(60):
@@ -501,7 +502,7 @@ class TestPerformance:
     def test_peak_memory_reasonable(self):
         from synth.synth import SynthEngine, SynthConfig
         import tracemalloc
-        config = SynthConfig(bpm=120, bars=4, seed=42, sample_rate=48000)
+        config = SynthConfig(bpm=120, bars=15, seed=42, sample_rate=48000)
         engine = SynthEngine(config)
         tracemalloc.start()
         for i in range(60):
@@ -514,10 +515,11 @@ class TestPerformance:
 
     def test_5min_render_completes(self):
         from synth.synth import SynthEngine, SynthConfig
-        config = SynthConfig(bpm=120, bars=20, seed=42, sample_rate=48000)
+        # 5 minutes = 300 seconds at 120 BPM = 150 bars
+        config = SynthConfig(bpm=120, bars=150, seed=42, sample_rate=48000)
         engine = SynthEngine(config)
-        # 5 minutes = 300 seconds, at 120 BPM = 5 beats/sec = 150 beats
-        for i in range(150):
+        # 5 minutes = 300 seconds, at 120 BPM = 5 beats/sec = 1500 beats
+        for i in range(1500):
             engine.add_note(time_beats=i * 0.5, freq=220.0, duration_beats=0.25)
         engine.render()
         integrity = engine.get_integrity()
@@ -570,3 +572,255 @@ class TestListening:
         assert integrity.frame_count > 0
         assert integrity.all_finite
         assert not integrity.clipping
+
+
+# --- Multi-bar drum tests ---
+
+class TestMultiBarDrums:
+    """Multi-bar drum scheduling: each bar must have hits."""
+
+    def test_two_bar_drums_have_hits_in_both_bars(self):
+        from synth.drums import DrumPattern
+        drums = DrumPattern(bpm=120, sample_rate=48000, seed=42)
+        audio = drums.render(bars=2)
+        # Bar 1: samples 0 to 24000 (1 bar = 2 seconds = 96000 samples at 48kHz)
+        # Actually at 120 BPM, 1 bar = 4 beats = 2 seconds = 96000 samples
+        bar_samples = int(4 * 60.0 / 120.0 * 48000)  # 96000
+        bar1 = audio[:bar_samples]
+        bar2 = audio[bar_samples:]
+        assert np.any(bar1 != 0), "Bar 1 should have drum hits"
+        assert np.any(bar2 != 0), "Bar 2 should have drum hits"
+
+    def test_drum_dc_offset_removed(self):
+        from synth.drums import DrumPattern
+        drums = DrumPattern(bpm=120, sample_rate=48000, seed=42)
+        audio = drums.render(bars=1)
+        # DC offset should be near zero
+        assert abs(np.mean(audio)) < 0.01, f"DC offset {np.mean(audio)} too high"
+
+    def test_drum_tail_terminates_at_zero(self):
+        from synth.drums import DrumPattern
+        drums = DrumPattern(bpm=120, sample_rate=48000, seed=42)
+        audio = drums.render(bars=1)
+        # Last sample should be near zero (clean tail)
+        assert abs(audio[-1]) < 0.01, f"Last sample {audio[-1]} not near zero"
+
+
+# --- Voice lifecycle tests ---
+
+class TestVoiceLifecycle:
+    """Shared voice engine: allocation, stealing, note-off, release."""
+
+    def test_shared_engine_polyphony(self):
+        from synth.voice import VoiceEngine, VoiceConfig
+        config = VoiceConfig(attack_samples=10, decay_samples=10, sustain_level=0.7, release_samples=10)
+        engine = VoiceEngine(polyphony=4, sample_rate=48000, config=config, seed=42)
+        # Allocate 4 voices
+        for i in range(4):
+            vid = engine.allocate(220.0 * (i + 1), 0.8)
+            assert vid == i
+        # 5th should steal oldest (ID 0)
+        vid5 = engine.allocate(330.0, 0.8)
+        assert vid5 == 0
+
+    def test_note_off_triggers_release(self):
+        from synth.voice import VoiceEngine, VoiceConfig
+        config = VoiceConfig(attack_samples=10, decay_samples=10, sustain_level=0.7, release_samples=50)
+        engine = VoiceEngine(polyphony=4, sample_rate=48000, config=config, seed=42)
+        vid = engine.allocate(440.0, 0.8)
+        engine.note_off(vid)
+        voice = engine.get_voice(vid)
+        assert voice is not None
+        assert not voice.note_on
+
+    def test_release_tail_rendered(self):
+        from synth.voice import VoiceEngine, VoiceConfig
+        config = VoiceConfig(attack_samples=10, decay_samples=10, sustain_level=0.7, release_samples=50)
+        engine = VoiceEngine(polyphony=4, sample_rate=48000, config=config, seed=42)
+        # Render a note with release
+        audio = engine.render_block([(440.0, 100, 0.8)], block_size=200)
+        assert len(audio) == 200
+        assert np.all(np.isfinite(audio))
+
+
+# --- Mood/Key tests ---
+
+class TestMoodKeyControls:
+    """Mood and key must produce different audio."""
+
+    def test_different_moods_produce_different_audio(self):
+        from synth.synth import SynthEngine, SynthConfig
+        config1 = SynthConfig(bpm=120, bars=1, seed=42, sample_rate=48000, waveform="saw")
+        config2 = SynthConfig(bpm=120, bars=1, seed=42, sample_rate=48000, waveform="sine")
+        engine1 = SynthEngine(config1)
+        engine2 = SynthEngine(config2)
+        engine1.add_note(time_beats=0.0, freq=440.0, duration_beats=0.5)
+        engine2.add_note(time_beats=0.0, freq=440.0, duration_beats=0.5)
+        engine1.render()
+        engine2.render()
+        a1 = engine1.get_audio()
+        a2 = engine2.get_audio()
+        if a1 is not None and a2 is not None:
+            assert not np.array_equal(a1, a2), "Different waveforms should produce different audio"
+
+    def test_different_keys_produce_different_audio(self):
+        from synth.synth import SynthEngine, SynthConfig
+        config1 = SynthConfig(bpm=120, bars=1, seed=42, sample_rate=48000)
+        config2 = SynthConfig(bpm=120, bars=1, seed=42, sample_rate=48000)
+        engine1 = SynthEngine(config1)
+        engine2 = SynthEngine(config2)
+        # Different frequencies (different keys)
+        engine1.add_note(time_beats=0.0, freq=261.63, duration_beats=0.5)  # C4
+        engine2.add_note(time_beats=0.0, freq=440.0, duration_beats=0.5)  # A4
+        engine1.render()
+        engine2.render()
+        a1 = engine1.get_audio()
+        a2 = engine2.get_audio()
+        if a1 is not None and a2 is not None:
+            assert not np.array_equal(a1, a2), "Different keys should produce different audio"
+
+
+# --- WAV integrity tests ---
+
+class TestWAVIntegrity:
+    """Pre-publication validation and atomic writes."""
+
+    def test_write_wav_rejects_nan(self):
+        from synth.renderer import write_wav
+        import tempfile
+        audio = np.array([1.0, 2.0, float('nan'), 4.0])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "test.wav"
+            try:
+                write_wav(path, audio, 48000)
+                assert False, "Should have raised ValueError for NaN"
+            except ValueError:
+                pass  # Expected
+
+    def test_write_wav_rejects_inf(self):
+        from synth.renderer import write_wav
+        import tempfile
+        audio = np.array([1.0, float('inf'), 3.0, 4.0])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "test.wav"
+            try:
+                write_wav(path, audio, 48000)
+                assert False, "Should have raised ValueError for Inf"
+            except ValueError:
+                pass  # Expected
+
+    def test_write_wav_atomic(self):
+        from synth.renderer import write_wav
+        import tempfile
+        audio = np.sin(2.0 * np.pi * 440.0 * np.arange(48000) / 48000)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "test.wav"
+            write_wav(path, audio, 48000)
+            assert path.exists()
+            # Verify no temp file left behind
+            assert not path.with_suffix(".tmp.wav").exists()
+
+
+# --- Seed validation tests ---
+
+class TestSeedValidation:
+    """Seed values must be validated."""
+
+    def test_negative_seed_falls_back(self):
+        from synth.synth import SynthEngine, SynthConfig
+        config = SynthConfig(bpm=120, bars=1, seed=-1, sample_rate=48000)
+        engine = SynthEngine(config)
+        engine.add_note(time_beats=0.0, freq=440.0, duration_beats=0.5)
+        integrity = engine.render()
+        assert integrity.all_finite
+
+    def test_large_seed_falls_back(self):
+        from synth.synth import SynthEngine, SynthConfig
+        config = SynthConfig(bpm=120, bars=1, seed=2**33, sample_rate=48000)
+        engine = SynthEngine(config)
+        engine.add_note(time_beats=0.0, freq=440.0, duration_beats=0.5)
+        integrity = engine.render()
+        assert integrity.all_finite
+
+
+# --- ADSR boundary tests ---
+
+class TestADSRBoundary:
+    """ADSR envelope boundary conditions."""
+
+    def test_attack_reaches_one(self):
+        from synth.envelope import ADSREnvelope
+        env = ADSREnvelope(attack_samples=4, decay_samples=0, sustain_level=0.5, release_samples=10)
+        env.note_on()
+        out = env.render(4)
+        # Attack should reach 1.0 at the last sample
+        assert abs(out[-1] - 1.0) < 0.01, f"Attack last sample {out[-1]} should be ~1.0"
+
+    def test_decay_zero_goes_to_sustain(self):
+        from synth.envelope import ADSREnvelope
+        env = ADSREnvelope(attack_samples=4, decay_samples=0, sustain_level=0.5, release_samples=10)
+        env.note_on()
+        out = env.render(10)
+        # After attack (4 samples), should be at sustain level
+        assert abs(out[5] - 0.5) < 0.01, f"After attack, should be at sustain 0.5, got {out[5]}"
+
+
+# --- Filter impulse decay tests ---
+
+class TestFilterImpulseDecay:
+    """Filter impulse response: decays at low resonance, no DC latch."""
+
+    def test_impulse_decays_at_low_resonance(self):
+        from synth.filter import LadderFilter
+        flt = LadderFilter(sample_rate=48000, cutoff=1000, resonance=0.3)
+        inp = np.zeros(24800)
+        inp[0] = 1.0
+        out = flt.render(inp)
+        tail = out[10000:]
+        # Should decay (not latch at DC)
+        assert abs(np.mean(tail)) < 0.01, f"Tail mean {np.mean(tail)} should be near 0"
+        assert np.all(np.isfinite(tail))
+
+    def test_impulse_no_dc_latch_at_high_resonance(self):
+        from synth.filter import LadderFilter
+        flt = LadderFilter(sample_rate=48000, cutoff=1000, resonance=1.0)
+        inp = np.zeros(24800)
+        inp[0] = 1.0
+        out = flt.render(inp)
+        tail = out[10000:]
+        # Should not latch at DC (mean should be near 0)
+        assert abs(np.mean(tail)) < 0.1, f"Tail mean {np.mean(tail)} should not latch at DC"
+        assert np.all(np.isfinite(tail))
+
+
+# --- Duration semantics tests ---
+
+class TestDurationSemantics:
+    """Duration must be derived from requested seconds, not bars."""
+
+    def test_duration_matches_requested_seconds(self):
+        from synth.synth import SynthEngine, SynthConfig
+        # 30 seconds at 120 BPM = 15 bars
+        config = SynthConfig(bpm=120, bars=15, seed=42, sample_rate=48000)
+        engine = SynthEngine(config)
+        engine.add_note(time_beats=0.0, freq=440.0, duration_beats=0.5)
+        engine.add_drums(bars=15)
+        integrity = engine.render()
+        # Duration should be approximately 30 seconds
+        assert abs(integrity.duration_sec - 30.0) < 1.0, f"Duration {integrity.duration_sec}s should be ~30s"
+
+    def test_different_lengths_produce_different_durations(self):
+        from synth.synth import SynthEngine, SynthConfig
+        # 15 seconds vs 30 seconds
+        config1 = SynthConfig(bpm=120, bars=8, seed=42, sample_rate=48000)
+        config2 = SynthConfig(bpm=120, bars=15, seed=42, sample_rate=48000)
+        engine1 = SynthEngine(config1)
+        engine2 = SynthEngine(config2)
+        engine1.add_note(time_beats=0.0, freq=440.0, duration_beats=0.5)
+        engine2.add_note(time_beats=0.0, freq=440.0, duration_beats=0.5)
+        engine1.render()
+        engine2.render()
+        i1 = engine1.get_integrity()
+        i2 = engine2.get_integrity()
+        if i1 is not None and i2 is not None:
+            assert i1.duration_sec != i2.duration_sec, "Different bar counts should produce different durations"

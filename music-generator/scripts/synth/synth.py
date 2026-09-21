@@ -50,6 +50,9 @@ class SynthEngine:
 
     def __init__(self, config: Optional[SynthConfig] = None) -> None:
         self.config = config or SynthConfig()
+        # Validate seed
+        if self.config.seed is not None and (self.config.seed < 0 or self.config.seed > 2**32 - 1):
+            self.config.seed = 202
         self._rng = np.random.RandomState(self.config.seed)
         self._arrangement = Arrangement(
             ArrangementConfig(
@@ -76,6 +79,10 @@ class SynthEngine:
         )
         self._rendered: Optional[np.ndarray] = None
         self._integrity: Optional[RenderIntegrity] = None
+        self._drum_bars: int = 0
+        self._kick_pattern: str = "four_on_floor"
+        self._snare_pattern: str = "backbeat"
+        self._hihat_pattern: str = "eighth"
 
     def add_note(
         self,
@@ -113,7 +120,7 @@ class SynthEngine:
         audio = self._arrangement.render()
 
         # Render drums and mix
-        if hasattr(self, "_drum_bars"):
+        if self._drum_bars > 0:
             drums = self._drums.render(
                 bars=self._drum_bars,
                 kick_pattern=self._kick_pattern,
@@ -137,9 +144,12 @@ class SynthEngine:
         # Integrity check
         self._integrity = render_integrity(audio, self.config.sample_rate)
 
-        # Write WAV if path provided
+        # Write WAV if path provided — with pre-publication validation
         if output_path is not None:
             from .renderer import write_wav
+            # Validate before writing
+            if not self._integrity.all_finite:
+                raise ValueError("Cannot write WAV: audio contains NaN or Inf")
             write_wav(output_path, audio, self.config.sample_rate)
 
         return self._integrity
@@ -151,7 +161,11 @@ class SynthEngine:
         return self._rendered
 
     def reset(self) -> None:
-        """Reset engine state."""
+        """Reset engine state completely."""
         self._arrangement.clear()
         self._rendered = None
         self._integrity = None
+        self._drum_bars = 0
+        self._kick_pattern = "four_on_floor"
+        self._snare_pattern = "backbeat"
+        self._hihat_pattern = "eighth"

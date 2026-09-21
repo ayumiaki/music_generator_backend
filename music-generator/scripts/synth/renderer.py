@@ -78,9 +78,13 @@ def write_wav(
     audio: NDArray[np.float64],
     sample_rate: int = 48000,
 ) -> Path:
-    """Write mono 16-bit WAV file."""
+    """Write mono 16-bit WAV file with pre-publication validation and atomic write."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Pre-publication validation
+    if not np.all(np.isfinite(audio)):
+        raise ValueError("Cannot write WAV: audio contains NaN or Inf")
 
     # Clamp to [-1, 1]
     audio_clamped = np.clip(audio, -1.0, 1.0)
@@ -88,12 +92,21 @@ def write_wav(
     # Convert to 16-bit PCM
     pcm = (audio_clamped * 32767).astype(np.int16)
 
-    with wave.open(str(path), "w") as wf:
+    # Atomic write: write to temp file, then rename
+    temp_path = path.with_suffix(".tmp.wav")
+    with wave.open(str(temp_path), "w") as wf:
         wf.setnchannels(1)
         wf.setsampwidth(2)  # 16-bit
         wf.setframerate(sample_rate)
         wf.writeframes(pcm.tobytes())
 
+    # Verify the written file
+    with wave.open(str(temp_path), "r") as wf:
+        if wf.getnframes() != len(audio):
+            raise ValueError(f"WAV verification failed: expected {len(audio)} frames, got {wf.getnframes()}")
+
+    # Atomic rename
+    temp_path.replace(path)
     return path
 
 

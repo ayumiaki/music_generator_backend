@@ -1,4 +1,4 @@
-"""Deterministic arrangement — sample-accurate sequencer."""
+"""Deterministic arrangement — sample-accurate sequencer with shared voice engine."""
 from dataclasses import dataclass, field
 from typing import Optional
 import numpy as np
@@ -38,6 +38,7 @@ class Arrangement:
 
     No cumulative floating-point sleeps. Timing is calculated from
     beat positions and BPM directly to sample indices.
+    Uses a shared VoiceEngine for proper polyphony and voice stealing.
     """
 
     def __init__(self, config: Optional[ArrangementConfig] = None) -> None:
@@ -73,14 +74,16 @@ class Arrangement:
         return int(beats * beat_duration * self.config.sample_rate)
 
     def get_total_samples(self) -> int:
-        """Total duration in samples."""
+        """Total duration in samples — fills the full bar count."""
         if not self.events:
             return 0
-        max_time = max(e.time_beats + e.duration_beats for e in self.events)
-        return self.beat_to_samples(max_time)
+        # Use bar count to determine total duration (not just last note)
+        beats_per_bar = 4
+        total_beats = self.config.bars * beats_per_bar
+        return self.beat_to_samples(total_beats)
 
     def render(self) -> np.ndarray:
-        """Render the arrangement to a PCM buffer."""
+        """Render the arrangement to a PCM buffer using shared voice engine."""
         from .oscillator import WavetableOscillator
         from .envelope import ADSREnvelope
         from .filter import LadderFilter
@@ -92,7 +95,26 @@ class Arrangement:
 
         output = np.zeros(total_samples, dtype=np.float64)
 
-        # Render each event
+        # Shared voice engine for proper polyphony and stealing
+        voice_config = VoiceConfig(
+            wavetable_size=self.config.wavetable_size,
+            waveform=self.config.waveform,
+            attack_samples=self.config.attack_samples,
+            decay_samples=self.config.decay_samples,
+            sustain_level=self.config.sustain_level,
+            release_samples=self.config.release_samples,
+            filter_cutoff=self.config.filter_cutoff,
+            filter_resonance=self.config.filter_resonance,
+            retrigger=self.config.retrigger,
+        )
+        engine = VoiceEngine(
+            polyphony=self.config.polyphony,
+            sample_rate=self.config.sample_rate,
+            config=voice_config,
+            seed=self.config.seed,
+        )
+
+        # Render each event through the shared engine
         for event in self.events:
             start_sample = self.beat_to_samples(event.time_beats)
             duration_samples = self.beat_to_samples(event.duration_beats)
@@ -105,26 +127,7 @@ class Arrangement:
             if duration_samples <= 0:
                 continue
 
-            # Create voice engine for this note
-            config = VoiceConfig(
-                wavetable_size=self.config.wavetable_size,
-                waveform=event.waveform,
-                attack_samples=self.config.attack_samples,
-                decay_samples=self.config.decay_samples,
-                sustain_level=self.config.sustain_level,
-                release_samples=self.config.release_samples,
-                filter_cutoff=self.config.filter_cutoff,
-                filter_resonance=self.config.filter_resonance,
-                retrigger=self.config.retrigger,
-            )
-            engine = VoiceEngine(
-                polyphony=self.config.polyphony,
-                sample_rate=self.config.sample_rate,
-                config=config,
-                seed=self.config.seed,
-            )
-
-            # Render the note
+            # Render note through shared engine
             note_audio = engine.render_block(
                 [(event.freq, duration_samples, event.amplitude)],
                 block_size=total_samples,

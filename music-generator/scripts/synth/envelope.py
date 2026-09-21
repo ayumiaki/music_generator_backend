@@ -97,7 +97,8 @@ class ADSREnvelope:
                     self._phase = "decay"
                     self._phase_pos = 0
                     continue
-                t = np.arange(self._phase_pos, self._phase_pos + take) / self.attack_samples
+                # Use linspace to ensure attack reaches exactly 1.0 at the end
+                t = np.linspace(0.0, 1.0, self.attack_samples, endpoint=True)[self._phase_pos:self._phase_pos + take]
                 output[out_pos : out_pos + take] = np.clip(t, 0.0, 1.0)
                 self._phase_pos += take
                 out_pos += take
