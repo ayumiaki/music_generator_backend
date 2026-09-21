@@ -416,6 +416,152 @@ def voice_chord(
     return v
 
 
+def _all_voicings(
+    root: int, quality: str, vr: VoiceRange, tension: float,
+) -> list[int]:
+    """All chord-tone MIDI pitches within a voice range."""
+    return _chord_tone_candidates(root, quality, vr, tension)
+
+
+def _build_voicing(
+    root: int, quality: str, label: str,
+    bass: int, harmony: list[int], melody: int,
+) -> Voicing:
+    """Build a Voicing from raw pitches."""
+    return Voicing(
+        bass=bass, harmony=harmony, melody=melody,
+        chord_root=root, chord_quality=quality, chord_label=label,
+    )
+
+
+def _voices_valid(v: Voicing, bass_range: VoiceRange, melody_range: VoiceRange) -> bool:
+    """Check voice ordering and range constraints."""
+    if v.harmony:
+        if len(v.harmony) >= 2 and v.harmony[0] >= v.harmony[1]:
+            return False
+        if v.bass >= v.harmony[0] and v.bass - 12 < bass_range.min_midi:
+            return False
+        if v.melody <= v.harmony[-1] and v.melody + 12 > melody_range.max_midi:
+            return False
+        if v.bass < bass_range.min_midi or v.bass > bass_range.max_midi:
+            return False
+        for h in v.harmony:
+            if h < bass_range.min_midi or h > melody_range.max_midi:
+                return False
+        if v.melody < melody_range.min_midi or v.melody > melody_range.max_midi:
+            return False
+    return True
+
+
+def _fixup_parallels(
+    voicings: list[Voicing],
+    bass_range: VoiceRange,
+    harmony_range: VoiceRange,
+    melody_range: VoiceRange,
+    tension: float,
+    max_passes: int = 3,
+    boundary_prev: Voicing | None = None,
+) -> list[Voicing]:
+    """Post-processing pass to eliminate parallels via local search.
+
+    For each consecutive pair with parallels, tries alternative voicings
+    for BOTH chords (not just the current one). Multiple passes allow
+    fixes to propagate through the progression.
+
+    boundary_prev: if set, the first chord is also checked against this
+    external voicing (for cross-section boundaries).
+    """
+    result = list(voicings)
+    # Prepend boundary voicing for checking (not modified, just used as reference)
+    if boundary_prev is not None:
+        result = [boundary_prev] + result
+
+    for _pass in range(max_passes):
+        changed = False
+        for i in range(1, len(result)):
+            prev_v = result[i - 1]
+            curr_v = result[i]
+            f, o = _check_parallels(prev_v, curr_v)
+            if f + o == 0:
+                continue
+
+            is_boundary = (boundary_prev is not None and i == 1)
+
+            # Generate alternatives for both prev and curr
+            curr_root, curr_qual, curr_label = curr_v.chord_root, curr_v.chord_quality, curr_v.chord_label
+            prev_root, prev_qual, prev_label = prev_v.chord_root, prev_v.chord_quality, prev_v.chord_label
+
+            curr_harmony_cands = _all_voicings(curr_root, curr_qual, harmony_range, tension)
+            curr_melody_cands = _all_voicings(curr_root, curr_qual, melody_range, tension)
+
+            best_total = f + o
+            best_prev, best_curr = prev_v, curr_v
+
+            # Try alternatives for current chord (keeping prev fixed)
+            for h0 in curr_harmony_cands[:10]:
+                curr_h1_cands = [c for c in curr_harmony_cands[:10] if c != h0]
+                for h1 in curr_h1_cands:
+                    for m in curr_melody_cands[:6]:
+                        if m <= max(h0, h1):
+                            continue
+                        alt_v = _build_voicing(curr_root, curr_qual, curr_label,
+                                               curr_v.bass, [h0, h1], m)
+                        af, ao = _check_parallels(prev_v, alt_v)
+                        if af + ao < best_total:
+                            best_total = af + ao
+                            best_curr = alt_v
+                            if best_total == 0:
+                                break
+                    if best_total == 0:
+                        break
+                if best_total == 0:
+                    break
+
+            # If still parallels, try alternatives for previous chord (keeping curr fixed)
+            # Skip if boundary — don't modify the previous section's voicing
+            if best_total > 0 and not is_boundary:
+                prev_harmony_cands = _all_voicings(prev_root, prev_qual, harmony_range, tension)
+                prev_melody_cands = _all_voicings(prev_root, prev_qual, melody_range, tension)
+                for h0 in prev_harmony_cands[:10]:
+                    for h1 in [c for c in prev_harmony_cands[:10] if c != h0]:
+                        for m in prev_melody_cands[:6]:
+                            if m <= max(h0, h1):
+                                continue
+                            alt_prev = _build_voicing(prev_root, prev_qual, prev_label,
+                                                       prev_v.bass, [h0, h1], m)
+                            # Check parallels with i-2 (if exists)
+                            if i >= 2:
+                                f2, o2 = _check_parallels(result[i - 2], alt_prev)
+                                if f2 + o2 > 0:
+                                    continue
+                            af, ao = _check_parallels(alt_prev, curr_v)
+                            if af + ao < best_total:
+                                best_total = af + ao
+                                best_prev = alt_prev
+                                if best_total == 0:
+                                    break
+                        if best_total == 0:
+                            break
+                    if best_total == 0:
+                        break
+
+            if best_curr is not curr_v:
+                result[i] = best_curr
+                changed = True
+            if best_prev is not prev_v:
+                result[i - 1] = best_prev
+                changed = True
+
+        if not changed:
+            break
+
+    # Strip boundary voicing if prepended
+    if boundary_prev is not None:
+        result = result[1:]
+
+    return result
+
+
 def voice_progression(
     progression: list[tuple[int, str, str]],
     bass_range: VoiceRange | None = None,
@@ -430,7 +576,17 @@ def voice_progression(
     Pass `initial_voicing` to continue from a previous section's final voicing
     (preserves voice leading across section boundaries).
     Register (0..1) controls where within each voice range pitches land.
+
+    Post-processing eliminates parallel fifths/octaves via local backtracking
+    search across consecutive chord pairs.
     """
+    if bass_range is None:
+        bass_range = VOICE_RANGES["bass"]
+    if harmony_range is None:
+        harmony_range = VOICE_RANGES["harmony"]
+    if melody_range is None:
+        melody_range = VOICE_RANGES["melody"]
+
     voicings: list[Voicing] = []
     prev: Voicing | None = initial_voicing
     for root, quality, label in progression:
@@ -440,6 +596,14 @@ def voice_progression(
         )
         voicings.append(v)
         prev = v
+
+    # Post-processing: fix parallels via local search with backtracking
+    # Pass initial_voicing as boundary to also check cross-section parallels
+    voicings = _fixup_parallels(
+        voicings, bass_range, harmony_range, melody_range, tension,
+        boundary_prev=initial_voicing,
+    )
+
     return voicings
 
 

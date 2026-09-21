@@ -341,11 +341,16 @@ class Composition:
 
         if contour_data is not None:
             # Use the cached/varied contour (A' motif reuse)
+            # Shift notes above min_pitch by octave increments
             if min_pitch is not None:
-                contour_data = [
-                    (t_off, dur, max(min_pitch, min(127, pitch)))
-                    for t_off, dur, pitch in contour_data
-                ]
+                shifted = []
+                for t_off, dur, pitch in contour_data:
+                    while pitch < min_pitch and pitch + 12 <= 127:
+                        pitch += 12
+                    if pitch < min_pitch:
+                        pitch = min_pitch
+                    shifted.append((t_off, dur, min(127, pitch)))
+                contour_data = shifted
             for t_off, dur, pitch in contour_data:
                 t = chord_start + t_off
                 section.notes.append(ScoreNote(
@@ -360,6 +365,17 @@ class Composition:
             # Generate contour anchored to voice-validated melody_pitch
             contour = self._melody_contour(n_notes, melody_pitch, chord_root, chord_quality,
                                            phrase_start=phrase_start, phrase_end=phrase_end)
+
+            # Final quantization pass: ensure ALL notes are diatonic
+            scale = scale_degrees(self.root_midi, self.effective_mode)
+            scale_pcs = sorted(set(s % 12 for s in scale))
+            contour = [self._quantize_to_scale(p, scale_pcs) for p in contour]
+
+            # Apply min_pitch shift (for A')
+            if min_pitch is not None:
+                contour = [p + 12 * ((min_pitch - p + 11) // 12) if p < min_pitch else p
+                           for p in contour]
+                contour = [min(127, p) for p in contour]
 
             contour_data = []
             for i in range(n_notes):
