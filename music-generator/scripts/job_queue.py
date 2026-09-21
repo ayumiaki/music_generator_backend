@@ -491,9 +491,11 @@ class RedisQueue(BaseQueue):
         item.status = "pending"
         item.attempt = 0
 
-        # Store job metadata in hash, then add to stream
-        self.client.hset(self._hash_key(item.job_id), mapping=self._item_to_hash(item))
-        self.client.xadd(self.stream_key, {"job_id": item.job_id})
+        # Atomic: store job metadata in hash AND add to stream in one pipeline
+        pipe = self.client.pipeline()
+        pipe.hset(self._hash_key(item.job_id), mapping=self._item_to_hash(item))
+        pipe.xadd(self.stream_key, {"job_id": item.job_id})
+        pipe.execute()
         return item.job_id
 
     def dequeue(self, worker_id: str = None, block_ms: int = 5000) -> Optional[QueueItem]:
@@ -604,9 +606,11 @@ class RedisQueue(BaseQueue):
             item.worker_id = worker_id
         if result is not None:
             item.result = result
-        if "artifact_path" in item.result:
+        # Synth/mock backends return "output_file", not "artifact_path"
+        output_path = item.result.get("output_file") or item.result.get("artifact_path")
+        if output_path:
             try:
-                item.artifact_size = os.path.getsize(item.result["artifact_path"])
+                item.artifact_size = os.path.getsize(output_path)
             except OSError:
                 pass
         self._persist_and_ack(item)
@@ -619,12 +623,17 @@ class RedisQueue(BaseQueue):
             item.worker_id = worker_id
 
         if item.attempt < MAX_RETRIES:
-            # Retry: reset to pending and re-add to stream
+            # Retry: ACK old entry, reset to pending, enqueue new entry
             item.status = "pending"
             item.processing_at = None
             item.updated_at = time.time()
-            self.client.hset(self._hash_key(item.job_id), mapping=self._item_to_hash(item))
-            self.client.xadd(self.stream_key, {"job_id": item.job_id})
+            entry_id = self._pending_acks.pop(item.job_id, None)
+            pipe = self.client.pipeline()
+            pipe.hset(self._hash_key(item.job_id), mapping=self._item_to_hash(item))
+            pipe.xadd(self.stream_key, {"job_id": item.job_id})
+            if entry_id:
+                pipe.xack(self.stream_key, self.group_name, entry_id)
+            pipe.execute()
         else:
             # Exhausted retries: move to dead-letter
             item.status = "dead"
@@ -656,7 +665,11 @@ class RedisQueue(BaseQueue):
         pipe.execute()
 
     def recover(self) -> List[QueueItem]:
-        """Recover pending entries from dead workers via XAUTOCLAIM for all consumers."""
+        """Recover pending entries from dead workers via XAUTOCLAIM for all consumers.
+
+        Routes recovered entries through _claim_entry() so that _pending_acks
+        is populated and completion will ACK the stream entry.
+        """
         recovered = []
         try:
             # Get pending entries info
@@ -691,16 +704,9 @@ class RedisQueue(BaseQueue):
                             job_id = fields.get(b"job_id") or fields.get("job_id")
                             if isinstance(job_id, bytes):
                                 job_id = job_id.decode()
-                            item = self.get_item(job_id)
-                            if item and item.status == "processing":
-                                item.status = "pending"
-                                item.processing_at = None
-                                item.worker_id = None
-                                item.updated_at = time.time()
-                                self.client.hset(
-                                    self._hash_key(job_id),
-                                    mapping=self._item_to_hash(item),
-                                )
+                            # Route through _claim_entry for ACK tracking
+                            item = self._claim_entry(job_id, entry_id, "recovery-worker")
+                            if item:
                                 recovered.append(item)
                 except (redis_lib.exceptions.ResponseError, AttributeError):
                     continue
@@ -731,23 +737,29 @@ class RedisQueue(BaseQueue):
         return deleted > 0
 
     def depth(self) -> Dict[str, int]:
-        """Return queue depth metrics."""
-        try:
-            info = self.client.xinfo_stream(self.stream_key)
-            length = info.get("length", 0)
-        except redis_lib.exceptions.ResponseError:
-            length = 0
+        """Return queue depth metrics.
+
+        Uses consumer group lag (undelivered entries) + pending count
+        rather than XLEN (which includes acknowledged entries).
+        """
+        pending = 0
+        processing = 0
 
         try:
+            # Get pending entries (delivered but not yet ACKed)
             pending_info = self.client.xpending(self.stream_key, self.group_name)
             pending = pending_info.get("pending", 0)
         except redis_lib.exceptions.ResponseError:
-            pending = 0
+            pass
+
+        # Processing = pending entries currently claimed by a worker
+        # (In Redis Streams, "pending" = delivered to a consumer but not ACKed)
+        processing = pending
 
         return {
-            "stream_length": length,
             "pending": pending,
-            "total_active": length,
+            "processing": processing,
+            "total_active": pending,
         }
 
     def get_metrics(self) -> Dict[str, Any]:

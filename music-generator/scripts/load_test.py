@@ -56,12 +56,13 @@ def run_single_job_lifecycle(url: str, job: dict, poll_interval: float = 0.5,
     """One complete lifecycle: submit → poll → download, with OWN session.
 
     Returns per-job timing so no barrier contamination.
+    Uses server-side timestamps (completed_at) for accurate render time.
     """
     result = {
         "job_id": None,
         "submit_start": None,
         "submit_202": None,
-        "completed_at": None,
+        "completed_at": None,  # Server-side timestamp
         "artifact_request_start": None,
         "first_byte_at": None,
         "download_completed": None,
@@ -73,6 +74,7 @@ def run_single_job_lifecycle(url: str, job: dict, poll_interval: float = 0.5,
         "processing_at": None,
         "worker_id": None,
         "attempt": None,
+        "render_duration_ms": None,
     }
     session = requests.Session()
     try:
@@ -103,9 +105,13 @@ def run_single_job_lifecycle(url: str, job: dict, poll_interval: float = 0.5,
                     result["status"] = status
                     result["queued_at"] = st.get("queued_at")
                     result["processing_at"] = st.get("processing_at")
-                    result["completed_at"] = time.time()
+                    # Use SERVER-side completed_at for accurate render time
+                    result["completed_at"] = st.get("completed_at")
                     result["worker_id"] = st.get("worker_id")
                     result["attempt"] = st.get("attempt")
+                    # Derive render duration from server timestamps
+                    if result["processing_at"] and result["completed_at"]:
+                        result["render_duration_ms"] = (result["completed_at"] - result["processing_at"]) * 1000
                     break
             time.sleep(poll_interval)
         else:
@@ -276,6 +282,15 @@ def run_load_test(url: str, num_jobs: int, concurrency: int, job_length: int = 5
         print(f"  p95: {pct(render_times, 95)*1000:.1f} ms")
         print(f"  p99: {pct(render_times, 99)*1000:.1f} ms")
 
+    # Server-reported render duration (actual backend processing time)
+    server_render_durations = [r["render_duration_ms"] for r in results if r.get("render_duration_ms") is not None]
+    if server_render_durations:
+        print(f"\nServer-Reported Render Duration (processing_at → completed_at):")
+        print(f"  p50: {pct(server_render_durations, 50):.1f} ms")
+        print(f"  p95: {pct(server_render_durations, 95):.1f} ms")
+        print(f"  p99: {pct(server_render_durations, 99):.1f} ms")
+        print(f"  max: {max(server_render_durations):.1f} ms")
+
     # Artifact TTFB (from own request start to first byte)
     artifact_ttfb = []
     for r in results:
@@ -363,7 +378,16 @@ def run_load_test(url: str, num_jobs: int, concurrency: int, job_length: int = 5
     # Queue depth over time
     samples = sampler.get_samples()
     if samples:
-        depths = [s.get("total_active", s.get("stream_length", 0)) for s in samples]
+        depths = []
+        for s in samples:
+            if "total_active" in s:
+                depths.append(s["total_active"])
+            elif "depth" in s and isinstance(s["depth"], dict):
+                depths.append(s["depth"].get("total_active", 0))
+            elif "depth" in s:
+                depths.append(s["depth"])
+            else:
+                depths.append(0)
         if depths:
             print(f"\nQueue Depth Over Time (sampled every 2s):")
             print(f"  min: {min(depths)}")

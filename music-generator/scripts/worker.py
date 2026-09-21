@@ -49,6 +49,7 @@ def process_job(queue, backend, item: QueueItem, worker_id: Optional[str] = None
     # Install alarm-based timeout before calling backend
     old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
     old_alarm = signal.alarm(JOB_TIMEOUT)
+    render_start = time.perf_counter()
     try:
         result = backend.generate(
             job_id=item.job_id,
@@ -60,6 +61,8 @@ def process_job(queue, backend, item: QueueItem, worker_id: Optional[str] = None
             seed=item.seed,
         )
         signal.alarm(0)  # cancel alarm on success
+        render_duration_ms = (time.perf_counter() - render_start) * 1000
+        result["render_duration_ms"] = render_duration_ms
         if result.get("status") == "success":
             queue.complete(item, result, worker_id=worker_id)
             print(f"Job {item.job_id} completed successfully")
@@ -68,10 +71,14 @@ def process_job(queue, backend, item: QueueItem, worker_id: Optional[str] = None
             print(f"Job {item.job_id} failed: {result.get('error')}")
     except JobTimeoutError:
         signal.alarm(0)
+        render_duration_ms = (time.perf_counter() - render_start) * 1000
+        item.result["render_duration_ms"] = render_duration_ms
         queue.fail(item, f"Job exceeded timeout of {JOB_TIMEOUT}s", worker_id=worker_id)
         print(f"Job {item.job_id} timed out after {JOB_TIMEOUT}s")
     except Exception as e:
         signal.alarm(0)
+        render_duration_ms = (time.perf_counter() - render_start) * 1000
+        item.result["render_duration_ms"] = render_duration_ms
         queue.fail(item, f"Worker exception: {str(e)}", worker_id=worker_id)
         print(f"Job {item.job_id} failed with exception: {e}")
     finally:

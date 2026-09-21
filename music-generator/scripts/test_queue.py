@@ -107,7 +107,7 @@ class TestFileQueueBasic(QueueTestSuite):
         q = self._make_queue()
         job_id = q.enqueue(self._make_item())
         item = q.dequeue(worker_id="w1")
-        q.complete(item, result={"artifact_path": "/fake/path.wav"})
+        q.complete(item, result={"output_file": "/fake/path.wav"})
         depth = q.depth()
         self.assertEqual(depth["total_active"], 0)
 
@@ -222,7 +222,7 @@ class TestFileQueueCompleteFail(QueueTestSuite):
         item = q.dequeue(worker_id="w1")
         self.assertIsNone(item.completed_at)
 
-        q.complete(item, result={"artifact_path": "/tmp/fake.wav"})
+        q.complete(item, result={"output_file": "/tmp/fake.wav"})
         self.assertIsNotNone(item.completed_at)
 
     def test_fail_with_retries(self):
@@ -341,7 +341,7 @@ class TestRedisQueueStreams(unittest.TestCase):
     def test_complete_and_ack(self):
         job_id = self.queue.enqueue(self._make_item())
         item = self.queue.dequeue(worker_id="w1")
-        self.queue.complete(item, result={"artifact_path": "/fake/path.wav"})
+        self.queue.complete(item, result={"output_file": "/fake/path.wav"})
 
         # After completion, item should be marked completed
         reloaded = self.queue.get_item(job_id)
