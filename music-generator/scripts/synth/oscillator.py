@@ -1,6 +1,26 @@
-"""Wavetable oscillator with phase continuity, interpolation, alias control."""
+"""Band-limited wavetable oscillator with PolyBLEP and integer-sample phase."""
 import numpy as np
 from numpy.typing import NDArray
+
+
+def _polyblep(t: NDArray[np.float64], dt: float) -> NDArray[np.float64]:
+    """PolyBLEP discontinuity correction for a saw/square wave.
+
+    t : phase in cycles [0, 1)
+    dt: phase increment per sample (freq / sample_rate)
+    """
+    if dt <= 0:
+        return np.zeros_like(t)
+    result = np.zeros_like(t, dtype=np.float64)
+    # Region just before discontinuity (t near 1)
+    mask = t > (1.0 - dt)
+    x = (t[mask] - 1.0) / dt
+    result[mask] = x * x + x + x + 1.0
+    # Region just after discontinuity (t near 0)
+    mask = t < dt
+    x = t[mask] / dt
+    result[mask] = x + x - x * x - 1.0
+    return result
 
 
 def make_wavetable(size: int = 4096, waveform: str = "saw") -> NDArray[np.float64]:
@@ -16,7 +36,6 @@ def make_wavetable(size: int = 4096, waveform: str = "saw") -> NDArray[np.float6
         tbl = np.sin(2.0 * np.pi * t)
     else:
         tbl = np.sin(2.0 * np.pi * t)
-    # Normalize to [-1, 1]
     max_val = np.max(np.abs(tbl))
     if max_val > 0:
         tbl = tbl / max_val
@@ -24,7 +43,11 @@ def make_wavetable(size: int = 4096, waveform: str = "saw") -> NDArray[np.float6
 
 
 class WavetableOscillator:
-    """Phase-continuous wavetable oscillator with interpolation and deterministic phase reset."""
+    """Phase-continuous wavetable oscillator with PolyBLEP alias suppression.
+
+    Phase authority is an integer sample counter — rendering is partition-invariant
+    regardless of block boundaries. The seed applies a deterministic phase offset.
+    """
 
     def __init__(
         self,
@@ -36,24 +59,20 @@ class WavetableOscillator:
         self.sample_rate = sample_rate
         self.table_size = table_size
         self.table = make_wavetable(table_size, waveform)
-        self.phase = 0.0  # in table indices [0, table_size)
+        self._waveform = waveform
+        self._sample_pos: int = 0
         self._rng = np.random.RandomState(seed)
-        # Seed-based initial phase offset for determinism
-        if seed is not None:
-            self._seed_offset = float(seed % table_size)
-        else:
-            self._seed_offset = 0.0
+        # Seed-based phase offset in cycles [0, 1)
+        self._seed_phase_offset = (seed % table_size) / table_size if seed is not None else 0.0
 
     def reset(self) -> None:
-        """Hard reset — phase goes to zero deterministically."""
-        self.phase = 0.0
+        self._sample_pos = 0
 
     def set_phase(self, phase: float) -> None:
-        """Set phase explicitly (mod table_size)."""
-        self.phase = float(phase) % self.table_size
+        self._sample_pos = int(phase * self.sample_rate)
 
     def get_phase(self) -> float:
-        return self.phase
+        return (self._sample_pos % self.sample_rate) / self.sample_rate
 
     def render(
         self,
@@ -62,41 +81,42 @@ class WavetableOscillator:
         phase_reset: bool = False,
         reset_phase: float = 0.0,
     ) -> NDArray[np.float64]:
-        """Render n_frames at given frequency. Phase-continuous across calls."""
         if n_frames <= 0:
             return np.array([], dtype=np.float64)
 
         if phase_reset:
-            self.phase = reset_phase % self.table_size
+            self._sample_pos = int(reset_phase * self.sample_rate)
 
-        # Frequency -> phase increment
-        phase_inc = freq * self.table_size / self.sample_rate
+        # Absolute sample indices for this block
+        indices = np.arange(self._sample_pos, self._sample_pos + n_frames, dtype=np.float64)
+        # Phase in cycles [0, 1) with seed offset
+        t = (freq * indices / self.sample_rate + self._seed_phase_offset) % 1.0
+        dt = freq / self.sample_rate
 
-        # Generate phase values, starting from current phase + seed offset
-        start_phase = self.phase + self._seed_offset
-        phases = start_phase + np.arange(n_frames, dtype=np.float64) * phase_inc
+        if self._waveform == "sine":
+            out = np.sin(2.0 * np.pi * t)
+        elif self._waveform == "saw":
+            # Ideal saw: 2*(t - 0.5), corrected with PolyBLEP
+            out = 2.0 * (t - 0.5) - _polyblep(t, dt)
+        elif self._waveform == "square":
+            # Ideal square: +1 for t<0.5, -1 otherwise
+            ideal = np.where(t < 0.5, 1.0, -1.0)
+            # Corrections at t=0 (drop of 2) and t=0.5 (rise of 2)
+            out = ideal - _polyblep(t, dt) + _polyblep((t + 0.5) % 1.0, dt)
+        elif self._waveform == "triangle":
+            # Triangle: 2*|2*(t+0.25) - floor(2t+1)| - 1, no PolyBLEP needed (continuous)
+            out = 2.0 * np.abs(2.0 * (t + 0.25) - np.floor(2.0 * t + 1.0) - 1.0) - 1.0
+        else:
+            out = np.sin(2.0 * np.pi * t)
 
-        # Wrap phase to [0, table_size)
-        phases = phases % self.table_size
-
-        # Linear interpolation between adjacent table entries
-        idx_lo = np.floor(phases).astype(np.int64) % self.table_size
-        idx_hi = (idx_lo + 1) % self.table_size
-        frac = phases - np.floor(phases)
-
-        output = (1.0 - frac) * self.table[idx_lo] + frac * self.table[idx_hi]
-
-        # Update phase for next call (continuity)
-        self.phase = (self.phase + n_frames * phase_inc) % self.table_size
-
-        return output.astype(np.float64)
+        self._sample_pos += n_frames
+        return out.astype(np.float64)
 
     def render_block(
         self,
         notes: list[tuple[float, int]],
         block_size: int = 48000,
     ) -> NDArray[np.float64]:
-        """Render a block from a list of (freq, frames) tuples. Concatenates."""
         chunks = []
         for freq, n in notes:
             chunks.append(self.render(freq, n))
