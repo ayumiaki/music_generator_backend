@@ -49,15 +49,53 @@ class LadderFilter:
     def set_resonance(self, resonance: float) -> None:
         self.resonance = max(0.0, min(resonance, 1.0))
 
+    def _compute_alpha(self) -> float:
+        """Compute per-stage alpha for calibrated composite cutoff.
+
+        Four cascaded one-poles each at -3dB at the requested frequency
+        give -12dB there. We need each stage at 2^(-1/8) magnitude at
+        the composite cutoff so the cascade hits -3dB at the requested fc.
+
+        For one-pole y[n] = alpha*x[n] + (1-alpha)*y[n-1]:
+          |H(ω)|² = alpha² / (1 - 2r*cos(ω) + r²)  where r = 1-alpha
+
+        Setting |H|² = 2^(-1/4) (i.e. |H| = 2^(-1/8)) and solving:
+          (1-m²)r² + (-2 + 2m²cos(ω))r + (1-m²) = 0
+          where m² = 2^(-1/4), ω = 2πfc/fs
+
+        Pick root where 0 < r < 1, then alpha = 1 - r.
+        """
+        fc = max(1.0, min(self.cutoff, self.sample_rate / 2.0))
+        omega = 2.0 * np.pi * fc / self.sample_rate
+        m2 = 2.0 ** (-0.25)  # 2^(-1/4)
+
+        # Quadratic coefficients: a*r² + b*r + c = 0
+        a = 1.0 - m2
+        b = -2.0 + 2.0 * m2 * np.cos(omega)
+        c = 1.0 - m2
+
+        discriminant = b * b - 4.0 * a * c
+        if discriminant < 0:
+            # Fallback: standard one-pole coefficient
+            return 1.0 - np.exp(-2.0 * np.pi * fc / self.sample_rate)
+
+        sqrt_disc = np.sqrt(discriminant)
+        r1 = (-b + sqrt_disc) / (2.0 * a)
+        r2 = (-b - sqrt_disc) / (2.0 * a)
+
+        # Pick the root where 0 < r < 1
+        r = r1 if 0.0 < r1 < 1.0 else r2
+        if not (0.0 < r < 1.0):
+            r = r2 if 0.0 < r2 < 1.0 else r1
+
+        alpha = 1.0 - r
+        return max(0.0, min(alpha, 1.0))
+
     def render(self, input_signal: NDArray[np.float64]) -> NDArray[np.float64]:
         if len(input_signal) == 0:
             return input_signal.copy()
 
-        # One-pole coefficient: alpha = 1 - exp(-2*pi*fc/fs)
-        # At fc=20kHz, fs=48kHz: alpha ≈ 0.917 (very open)
-        # At fc=100Hz, fs=48kHz: alpha ≈ 0.013 (very closed)
-        alpha = 1.0 - np.exp(-2.0 * np.pi * self.cutoff / self.sample_rate)
-        alpha = max(0.0, min(alpha, 1.0))
+        alpha = self._compute_alpha()
 
         s1, s2, s3, s4 = self._s1, self._s2, self._s3, self._s4
         out = np.zeros(len(input_signal), dtype=np.float64)
