@@ -101,8 +101,9 @@ class WavetableOscillator:
         elif self._waveform == "square":
             # Ideal square: +1 for t<0.5, -1 otherwise
             ideal = np.where(t < 0.5, 1.0, -1.0)
-            # Corrections at t=0 (drop of 2) and t=0.5 (rise of 2)
-            out = ideal - _polyblep(t, dt) + _polyblep((t + 0.5) % 1.0, dt)
+            # At t=0: rise of +2 (from -1 to +1) → +polyblep correction
+            # At t=0.5: drop of -2 (from +1 to -1) → -polyblep correction
+            out = ideal + _polyblep(t, dt) - _polyblep((t + 0.5) % 1.0, dt)
         elif self._waveform == "triangle":
             # Triangle: 2*|2*(t+0.25) - floor(2t+1)| - 1, no PolyBLEP needed (continuous)
             out = 2.0 * np.abs(2.0 * (t + 0.25) - np.floor(2.0 * t + 1.0) - 1.0) - 1.0
