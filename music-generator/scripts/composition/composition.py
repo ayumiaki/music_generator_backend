@@ -288,6 +288,9 @@ class Composition:
                 # min_pitch: melody must stay above the highest harmony note
                 _max_harmony = max(voicings[i].harmony) if voicings[i].harmony else None
                 _min_pitch = _max_harmony + 1 if _max_harmony is not None else None
+                # For A′: anchor the motif variation to the voice-validated
+                # melody_pitch so the first note passes parallel avoidance.
+                _anchor = voicing.melody if use_saved_melody else None
                 melody_notes = self._add_melody_notes(
                     section,
                     chord_start,
@@ -300,6 +303,7 @@ class Composition:
                     use_cached_contour=_cached is not None,
                     cached_contour=_cached,
                     min_pitch=_min_pitch,
+                    anchor_pitch=_anchor,
                 )
                 section_melody_notes.append(melody_notes)
 
@@ -314,6 +318,11 @@ class Composition:
             beat_cursor += sec_beats
 
         score.total_beats = beat_cursor
+
+        # Post-validation: catch any parallels introduced by A′ motif
+        # transformation or other post-voicing modifications.
+        self._post_validate_score(score)
+
         return score
 
     def _scale_ceiling(self, pitch: int, scale_pcs: list[int], max_midi: int) -> int:
@@ -351,6 +360,7 @@ class Composition:
         use_cached_contour: bool = False,
         cached_contour: list[tuple[float, float, int]] | None = None,
         min_pitch: int | None = None,
+        anchor_pitch: int | None = None,
     ) -> list[tuple[float, float, int]]:
         """Add melody notes for one chord's duration with contour.
 
@@ -364,6 +374,11 @@ class Composition:
         min_pitch: if set, all melody notes are shifted to be >= min_pitch
         (used to prevent voice crossing with harmony).  The value is pre-
         computed by the caller as a scale-tone ceiling.
+
+        anchor_pitch: if set (A' only), the varied contour starts from this
+        voice-validated pitch instead of the cached contour's first pitch,
+        ensuring the motif variation begins from a pitch that passed
+        parallel-avoidance validation.
 
         Returns a list of (time_offset, duration, pitch) tuples representing
         the contour, for motif caching in A'.
@@ -397,7 +412,8 @@ class Composition:
 
         # For motif reuse (A'): replay A's contour with variation
         if use_cached_contour and cached_contour is not None:
-            contour_data = self._vary_melody_contour(cached_contour, n_notes, chord_root, chord_quality)
+            contour_data = self._vary_melody_contour(cached_contour, n_notes, chord_root, chord_quality,
+                                                      anchor_pitch=anchor_pitch)
         else:
             contour_data = None
 
@@ -480,13 +496,18 @@ class Composition:
         n_notes: int,
         chord_root: int,
         chord_quality: str,
+        anchor_pitch: int | None = None,
     ) -> list[tuple[float, float, int]]:
         """Create a rhythmic variation of a cached motif for A'.
 
-        Keeps the pitch sequence intact (recognizable motif) but varies:
+        Keeps the pitch sequence recognizable but varies:
         - Duration pattern (swap adjacent note lengths)
-        - Syncopation (shift onset slightly for some notes)
         - Contour direction inversion (mirror the intervals)
+
+        If anchor_pitch is provided (A′'s voice-validated melody_pitch),
+        the varied contour starts from that pitch instead of the cached
+        contour's first pitch.  This ensures the motif variation begins
+        from a pitch that passed parallel-avoidance validation.
 
         All output pitches are quantised to the active scale.
         """
@@ -505,7 +526,14 @@ class Composition:
 
         # Vary by inverting the contour direction (mirror intervals)
         if len(pitches) >= 2 and len(cached) > 0:
-            first = pitches[0]
+            # Use anchor_pitch as starting point if provided (A′ voice-validated),
+            # otherwise fall back to the cached contour's first pitch.
+            # Quantize anchor to scale — chord-tone 7ths may not belong to the
+            # active scale (e.g., min7 over harmonic_minor).
+            if anchor_pitch is not None:
+                first = self._quantize_to_scale(anchor_pitch, sorted(scale_pcs))
+            else:
+                first = pitches[0]
             intervals = [pitches[i] - pitches[i-1] for i in range(1, len(pitches))]
             # Invert intervals
             varied = [first]
@@ -618,6 +646,130 @@ class Composition:
                 best_pc = spc
         octave = pitch // 12
         return octave * 12 + best_pc
+
+    def _post_validate_score(self, score: Score) -> None:
+        """Post-validation pass over emitted chord-onset voices.
+
+        Detects and fixes parallel fifths/octaves in the actual emitted
+        score (after A′ motif transformation and all other transformations).
+
+        For each chord transition, extracts the chord-onset voices from
+        the score's notes, detects parallels, and adjusts the offending
+        voice (melody or bass) by an octave to break them.
+        """
+        from .voice_leading import VOICE_RANGES
+        melody_range = VOICE_RANGES["melody"]
+        scale = scale_degrees(self.root_midi, self.effective_mode)
+        scale_pcs = sorted(set(s % 12 for s in scale))
+
+        # Collect chord-onset voices for each chord in the score
+        chord_voicings = []  # list of (bass_pitch, melody_pitch, [harmony_pitches])
+        for section in score.sections:
+            for chord in section.chords:
+                t = chord.time_beats
+                bass_p = None
+                melody_p = None
+                harmony_ps = []
+                for note in section.notes:
+                    if abs(note.time_beats - t) < 0.001:
+                        if note.voice == VOICE_BASS:
+                            bass_p = note.pitch_midi
+                        elif note.voice == VOICE_MELODY:
+                            melody_p = note.pitch_midi
+                        elif note.voice == VOICE_HARMONY:
+                            harmony_ps.append(note.pitch_midi)
+                if bass_p is not None and melody_p is not None:
+                    chord_voicings.append((bass_p, melody_p, harmony_ps))
+
+        # Check consecutive pairs
+        for i in range(1, len(chord_voicings)):
+            prev_b, prev_m, prev_h = chord_voicings[i - 1]
+            curr_b, curr_m, curr_h = chord_voicings[i]
+
+            prev_all = [prev_b, prev_m] + prev_h
+            curr_all = [curr_b, curr_m] + curr_h
+            f, o = detect_parallel_fifths_octaves(prev_all, curr_all)
+            if f + o == 0:
+                continue
+
+            # Try shifting the current melody up or down by an octave
+            best_m = curr_m
+            for oct_shift in [12, -12]:
+                test_m = curr_m + oct_shift
+                if test_m < melody_range.min_midi or test_m > melody_range.max_midi:
+                    continue
+                test_all = [curr_b, test_m] + curr_h
+                tf, to = detect_parallel_fifths_octaves(prev_all, test_all)
+                if tf + to < f + o:
+                    best_m = test_m
+                    break
+
+            # Try shifting the current bass
+            best_b = curr_b
+            bass_vr = VOICE_RANGES["bass"]
+            for oct_shift in [12, -12]:
+                test_b = curr_b + oct_shift
+                if test_b < bass_vr.min_midi or test_b > bass_vr.max_midi:
+                    continue
+                test_all = [test_b, best_m] + curr_h
+                tf, to = detect_parallel_fifths_octaves(prev_all, test_all)
+                if tf + to < f + o:
+                    best_b = test_b
+                    break
+
+            # If we made changes, update the score's notes
+            if best_m != curr_m or best_b != curr_b:
+                # Find and replace the notes in the score
+                section = None
+                chord = None
+                for s in score.sections:
+                    for c in s.chords:
+                        # Match by comparing voicing tuples
+                        t = c.time_beats
+                        b_p = None
+                        m_p = None
+                        for note in s.notes:
+                            if abs(note.time_beats - t) < 0.001:
+                                if note.voice == VOICE_BASS:
+                                    b_p = note.pitch_midi
+                                elif note.voice == VOICE_MELODY:
+                                    m_p = note.pitch_midi
+                        if b_p == curr_b and m_p == curr_m:
+                            section = s
+                            chord = c
+                            break
+                    if section is not None:
+                        break
+
+                if section is not None:
+                    # Replace notes (ScoreNote is frozen, so create new ones)
+                    new_notes = []
+                    for note in section.notes:
+                        if abs(note.time_beats - chord.time_beats) < 0.001:
+                            if note.voice == VOICE_BASS and best_b != curr_b:
+                                new_notes.append(ScoreNote(
+                                    time_beats=note.time_beats,
+                                    duration_beats=note.duration_beats,
+                                    pitch_midi=best_b,
+                                    amplitude=note.amplitude,
+                                    voice=note.voice,
+                                ))
+                            elif note.voice == VOICE_MELODY and best_m != curr_m:
+                                new_notes.append(ScoreNote(
+                                    time_beats=note.time_beats,
+                                    duration_beats=note.duration_beats,
+                                    pitch_midi=best_m,
+                                    amplitude=note.amplitude,
+                                    voice=note.voice,
+                                ))
+                            else:
+                                new_notes.append(note)
+                        else:
+                            new_notes.append(note)
+                    section.notes = new_notes
+
+                # Update the chord_voicings list for subsequent checks
+                chord_voicings[i] = (best_b, best_m, curr_h)
 
 
 def score_to_dict(score: Score) -> dict:
