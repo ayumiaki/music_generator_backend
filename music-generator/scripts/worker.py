@@ -35,6 +35,7 @@ def process_job(queue, backend, item: QueueItem) -> None:
     item.status = "processing"
     queue.update_item(item)
 
+    started = time.time()
     try:
         result = backend.generate(
             job_id=item.job_id,
@@ -42,23 +43,24 @@ def process_job(queue, backend, item: QueueItem) -> None:
             mood=item.mood,
             tempo=item.tempo,
             key=item.key,
-            length=item.length
+            length=item.length,
+            seed=item.seed,
         )
+        # Check timeout
+        if time.time() - started > JOB_TIMEOUT:
+            queue.fail(item, f"Job exceeded timeout of {JOB_TIMEOUT}s")
+            print(f"Job {item.job_id} timed out after {JOB_TIMEOUT}s")
+            return
+
         if result.get("status") == "success":
-            item.status = "completed"
-            item.result = result
+            queue.complete(item, result)
+            print(f"Job {item.job_id} completed successfully")
         else:
-            item.status = "failed"
-            item.result = result
+            queue.fail(item, result.get("error", "Backend returned failure"))
+            print(f"Job {item.job_id} failed: {result.get('error')}")
     except Exception as e:
-        item.status = "failed"
-        item.result = {
-            "status": "error",
-            "error": f"Worker exception: {str(e)}"
-        }
-    finally:
-        queue.update_item(item)
-        print(f"Job {item.job_id} finished with status: {item.status}")
+        queue.fail(item, f"Worker exception: {str(e)}")
+        print(f"Job {item.job_id} failed with exception: {e}")
 
 
 def main():

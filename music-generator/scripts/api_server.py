@@ -10,6 +10,7 @@ Exposes:
 import os
 import sys
 import json
+import random
 import time
 import uuid
 from pathlib import Path
@@ -58,12 +59,36 @@ def generate():
 
     mood = data.get('mood', 'neutral')
     key = data.get('key', 'C')
-    length = int(data.get('length', 30))
-    tempo = int(data.get('tempo', 120))
+    length = data.get('length', 30)
+    tempo = data.get('tempo', 120)
     seed = data.get('seed')  # None if omitted
+
+    try:
+        length = int(length)
+    except (TypeError, ValueError):
+        return jsonify({"error": "length must be an integer"}), 400
+    if not (1 <= length <= 300):
+        return jsonify({"error": "length must be between 1 and 300"}), 400
+
+    try:
+        tempo = int(tempo)
+    except (TypeError, ValueError):
+        return jsonify({"error": "tempo must be an integer"}), 400
+    if not (40 <= tempo <= 300):
+        return jsonify({"error": "tempo must be between 40 and 300"}), 400
+
+    if seed is not None:
+        try:
+            seed = int(seed)
+        except (TypeError, ValueError):
+            return jsonify({"error": "seed must be an integer"}), 400
 
     job_id = str(uuid.uuid4())
     created_at = time.time()
+
+    # Generate and persist a seed when omitted
+    if seed is None:
+        seed = random.randint(0, 2**31 - 1)
 
     item = QueueItem(
         job_id=job_id,
@@ -85,7 +110,7 @@ def generate():
         'status': 'queued',
         'created_at': created_at,
         'seed': seed
-    })
+    }), 202
 
 @app.route('/status/<job_id>', methods=['GET'])
 def status(job_id):

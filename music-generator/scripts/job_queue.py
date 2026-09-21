@@ -137,7 +137,7 @@ class FileQueue(BaseQueue):
         self._atomic_write(self.queue_file, json.dumps(ids, indent=2))
 
     def _job_file_path(self, job_id: str) -> Path:
-        return QUEUE_DIR / f"{job_id}.json"
+        return self.queue_dir / f"{job_id}.json"
 
     def enqueue(self, item: QueueItem) -> str:
         if not item.job_id:
@@ -165,6 +165,29 @@ class FileQueue(BaseQueue):
             self._atomic_write(job_file, json.dumps(item.to_dict(), indent=2))
             return item
         return None
+
+    def complete(self, item: QueueItem, result: dict = None) -> None:
+        """Mark completed and remove from pending queue list."""
+        item.status = "completed"
+        if result is not None:
+            item.result = result
+        job_file = self._job_file_path(item.job_id)
+        self._atomic_write(job_file, json.dumps(item.to_dict(), indent=2))
+        self._remove_from_queue_list(item.job_id)
+
+    def fail(self, item: QueueItem, error: str) -> None:
+        """Mark failed and remove from pending queue list."""
+        item.status = "failed"
+        item.result = {"error": error}
+        job_file = self._job_file_path(item.job_id)
+        self._atomic_write(job_file, json.dumps(item.to_dict(), indent=2))
+        self._remove_from_queue_list(item.job_id)
+
+    def _remove_from_queue_list(self, job_id: str) -> None:
+        ids = self._read_queue_ids()
+        if job_id in ids:
+            ids.remove(job_id)
+            self._write_queue_ids(ids)
 
     def recover(self) -> List[QueueItem]:
         """Pick up any jobs stuck in 'processing' state after a crash."""

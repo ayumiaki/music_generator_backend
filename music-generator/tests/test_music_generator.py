@@ -66,6 +66,43 @@ class TestFileQueueAtomicity:
         assert recovered[0].seed == 13
         assert recovered[0].status == "pending"
 
+    def test_complete_removes_from_queue_list(self, q):
+        item = QueueItem(job_id="c1", prompt="z", mood="c", tempo=100, key="C", length=10, seed=1)
+        q.enqueue(item)
+        got = q.dequeue()  # processing
+        q.complete(got, {"status": "success", "output_file": "/tmp/x.wav"})
+        # Should not appear in dequeue anymore
+        next_item = q.dequeue()
+        assert next_item is None
+        # But still queryable by ID
+        query = q.get_item("c1")
+        assert query is not None
+        assert query.status == "completed"
+
+    def test_fail_removes_from_queue_list(self, q):
+        item = QueueItem(job_id="d1", prompt="z", mood="c", tempo=100, key="C", length=10, seed=2)
+        q.enqueue(item)
+        got = q.dequeue()
+        q.fail(got, "some error")
+        next_item = q.dequeue()
+        assert next_item is None
+        query = q.get_item("d1")
+        assert query.status == "failed"
+
+    def test_custom_queue_dir_isolated(self, queue_dir):
+        """FileQueue with custom queue_dir stays isolated from global QUEUE_DIR."""
+        q1 = FileQueue(queue_dir=queue_dir)
+        item = QueueItem(job_id="iso1", prompt="p", mood="c", tempo=100, key="C", length=10, seed=5)
+        q1.enqueue(item)
+        got = q1.dequeue()
+        assert got.seed == 5
+        # The global QUEUE_DIR should not contain iso1
+        from config import QUEUE_DIR
+        global_job = QUEUE_DIR / "iso1.json"
+        assert not global_job.exists()
+        # But the custom dir has it
+        assert (queue_dir / "iso1.json").exists()
+
 
 class TestMockBackend:
     def test_module_loads_without_numpy(self, monkeypatch):
@@ -86,6 +123,14 @@ class TestMockBackend:
         b = MockBackend()
         result = b.generate("x2", "p", "c", 120, "A", 3)
         assert result["status"] == "success"
+        assert "output_file" in result
+
+    def test_backend_receives_seed(self):
+        """Backend should receive the seed parameter."""
+        b = MockBackend()
+        result = b.generate("x3", "p", "c", 120, "C", 5, seed=42)
+        assert result["status"] == "success"
+        # Metadata should reflect seed if stored; at minimum call succeeds
         assert "output_file" in result
 
 
@@ -112,13 +157,36 @@ class TestApiEndpoints:
     def test_generate_valid(self, client):
         r = client.post("/generate", json={"prompt": "hi", "seed": 555},
                         headers={"Authorization": "Bearer test-token"})
-        assert r.status_code == 200
+        assert r.status_code == 202
         data = r.get_json()
         assert data["seed"] == 555
         assert data["status"] == "queued"
 
+    def test_generate_assigns_seed_when_omitted(self, client):
+        r = client.post("/generate", json={"prompt": "hi"},
+                        headers={"Authorization": "Bearer test-token"})
+        assert r.status_code == 202
+        data = r.get_json()
+        assert data["seed"] is not None
+        assert isinstance(data["seed"], int)
+
     def test_generate_validates_prompt(self, client):
         r = client.post("/generate", json={"prompt": "", "seed": 1},
+                        headers={"Authorization": "Bearer test-token"})
+        assert r.status_code == 400
+
+    def test_generate_validates_tempo(self, client):
+        r = client.post("/generate", json={"prompt": "hi", "tempo": "not-an-int"},
+                        headers={"Authorization": "Bearer test-token"})
+        assert r.status_code == 400
+
+    def test_generate_validates_length(self, client):
+        r = client.post("/generate", json={"prompt": "hi", "length": 0},
+                        headers={"Authorization": "Bearer test-token"})
+        assert r.status_code == 400
+
+    def test_generate_validates_seed(self, client):
+        r = client.post("/generate", json={"prompt": "hi", "seed": "bad"},
                         headers={"Authorization": "Bearer test-token"})
         assert r.status_code == 400
 

@@ -1,8 +1,0 @@
-Mock music generation
-Job ID: x
-Prompt: p
-Mood: c
-Tempo: 100
-Key: C
-Length: 5 seconds
-Generated at: Mon Sep 21 10:04:53 2026

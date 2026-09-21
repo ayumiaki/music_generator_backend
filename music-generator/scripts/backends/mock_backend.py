@@ -22,7 +22,7 @@ class MockBackend(BaseBackend):
         except ImportError:
             pass
 
-    def generate(self, job_id: str, prompt: str, mood: str, tempo: int, key: str, length: int) -> dict:
+    def generate(self, job_id: str, prompt: str, mood: str, tempo: int, key: str, length: int, seed: int | None = None) -> dict:
         # Lazy-import numpy for random delay
         np = None
         if self._can_generate_audio:
