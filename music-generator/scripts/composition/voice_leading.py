@@ -461,6 +461,7 @@ def _fixup_parallels(
     tension: float,
     max_passes: int = 3,
     boundary_prev: Voicing | None = None,
+    frozen_first: bool = False,
 ) -> list[Voicing]:
     """Post-processing pass to eliminate parallels via local search.
 
@@ -470,6 +471,9 @@ def _fixup_parallels(
 
     boundary_prev: if set, the first chord is also checked against this
     external voicing (for cross-section boundaries).
+
+    frozen_first: if True, the first chord (index 0 in voicings) is not
+    modified — it was pre-computed with boundary awareness.
     """
     result = list(voicings)
     # Prepend boundary voicing for checking (not modified, just used as reference)
@@ -487,6 +491,11 @@ def _fixup_parallels(
 
             is_boundary = (boundary_prev is not None and i == 1)
 
+            # If frozen_first and this is the boundary pair (i=1), skip —
+            # the first chord was pre-computed with boundary awareness
+            if is_boundary and frozen_first:
+                continue
+
             # Generate alternatives for both prev and curr
             curr_root, curr_qual, curr_label = curr_v.chord_root, curr_v.chord_quality, curr_v.chord_label
             prev_root, prev_qual, prev_label = prev_v.chord_root, prev_v.chord_quality, prev_v.chord_label
@@ -498,6 +507,8 @@ def _fixup_parallels(
             best_prev, best_curr = prev_v, curr_v
 
             # Try alternatives for current chord (keeping prev fixed)
+            # When is_boundary and frozen_first, we skip — but we already
+            # continued above, so this code is only for within-section pairs
             for h0 in curr_harmony_cands[:10]:
                 curr_h1_cands = [c for c in curr_harmony_cands[:10] if c != h0]
                 for h1 in curr_h1_cands:
@@ -519,7 +530,11 @@ def _fixup_parallels(
 
             # If still parallels, try alternatives for previous chord (keeping curr fixed)
             # Skip if boundary — don't modify the previous section's voicing
-            if best_total > 0 and not is_boundary:
+            # Skip if frozen_first and we'd modify the first chord (result[1])
+            can_modify_prev = not is_boundary
+            if frozen_first and i - 1 == 1:
+                can_modify_prev = False
+            if best_total > 0 and can_modify_prev:
                 prev_harmony_cands = _all_voicings(prev_root, prev_qual, harmony_range, tension)
                 prev_melody_cands = _all_voicings(prev_root, prev_qual, melody_range, tension)
                 for h0 in prev_harmony_cands[:10]:
@@ -570,12 +585,18 @@ def voice_progression(
     tension: float = 0.0,
     register: float = 0.5,
     initial_voicing: Voicing | None = None,
+    first_voicing: Voicing | None = None,
 ) -> list[Voicing]:
     """Voice an entire chord progression with continuous voice state.
 
     Pass `initial_voicing` to continue from a previous section's final voicing
     (preserves voice leading across section boundaries).
     Register (0..1) controls where within each voice range pitches land.
+
+    If `first_voicing` is provided, it is used as the voicing for the first
+    chord instead of re-voicing it.  This is used for section boundaries
+    where the first chord has already been optimised for cross-section
+    parallel avoidance.
 
     Post-processing eliminates parallel fifths/octaves via local backtracking
     search across consecutive chord pairs.
@@ -589,7 +610,16 @@ def voice_progression(
 
     voicings: list[Voicing] = []
     prev: Voicing | None = initial_voicing
-    for root, quality, label in progression:
+
+    if first_voicing is not None and progression:
+        # Use the pre-computed first voicing (already boundary-optimised)
+        voicings.append(first_voicing)
+        prev = first_voicing
+        remaining = progression[1:]
+    else:
+        remaining = progression
+
+    for root, quality, label in remaining:
         v = voice_chord(
             root, quality, label, prev,
             bass_range, harmony_range, melody_range, tension, register,
@@ -599,9 +629,12 @@ def voice_progression(
 
     # Post-processing: fix parallels via local search with backtracking
     # Pass initial_voicing as boundary to also check cross-section parallels
+    # If first_voicing was pre-computed (boundary-optimized), freeze the first
+    # chord so the fixup doesn't undo the boundary optimization
     voicings = _fixup_parallels(
         voicings, bass_range, harmony_range, melody_range, tension,
         boundary_prev=initial_voicing,
+        frozen_first=(first_voicing is not None),
     )
 
     return voicings

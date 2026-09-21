@@ -58,6 +58,7 @@ class ScoreChord:
     root_midi: int
     quality: str = "maj"
     label: str = ""
+    extensions: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if self.duration_beats <= 0:

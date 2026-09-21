@@ -150,13 +150,12 @@ class Composition:
                 if sec_name == "A":
                     saved_a_state = (prog, None, None)  # will fill voicing+melody after voicing
 
-            # Section boundary: pre-check for parallels between previous section's
-            # last voicing and this section's first chord. If parallels exist,
-            # shift the initial bass BEFORE voice_progression so all subsequent
-            # parallel avoidance uses the corrected starting point.
+            # Section boundary: pre-compute the first chord's voicing with
+            # cross-section parallel avoidance, then pass it as first_voicing
+            # so voice_progression uses it directly (no re-voicing).
+            boundary_first_voicing = None
             if continuous_voicing_for_section is not None and prog:
                 prev_v = continuous_voicing_for_section
-                # Voice just the first chord to check
                 first_root, first_quality, first_label = prog[0]
                 first_v = voice_chord(
                     first_root, first_quality, first_label, prev_v,
@@ -185,15 +184,20 @@ class Composition:
                                 prev_all, [shifted_v.bass, shifted_v.melody] + shifted_v.harmony
                             )
                             if f2 + o2 < f + o:
-                                continuous_voicing_for_section = shifted_v
+                                first_v = shifted_v
                                 break
+                boundary_first_voicing = first_v
 
-            # Voice the progression with continuous state
+            # Voice the progression with continuous state.
+            # first_voicing: pre-computed boundary-aware first chord (used as-is).
+            # initial_voicing: passed to _fixup_parallels as boundary_prev for
+            # cross-section parallel checking.
             voicings = voice_progression(
                 prog,
                 tension=self.mood.tension,
                 register=self.mood.register,
                 initial_voicing=continuous_voicing_for_section,
+                first_voicing=boundary_first_voicing,
             )
 
             # Update continuous voicing to the last voicing of this section
@@ -220,13 +224,36 @@ class Composition:
                 chord_beats = sec_beats / max(len(prog), 1)
                 chord_start = beat_cursor + beat_in_section
 
+                # Detect tension-driven extensions (e.g., 7th added by tension)
+                from .harmony import CHORD_QUALITIES
+                base_intervals = set(CHORD_QUALITIES.get(quality, [0, 4, 7]))
+                extensions_detected = []
+                if voicing.harmony:
+                    for hp in voicing.harmony:
+                        interval_from_root = (hp - root) % 12
+                        if interval_from_root not in base_intervals:
+                            extensions_detected.append(interval_from_root)
+                extensions_tuple = tuple(sorted(set(extensions_detected)))
+
+                # Upgrade quality to reflect 7th if present
+                effective_quality = quality
+                if 11 in extensions_tuple and quality in ("maj", "aug"):
+                    effective_quality = "maj7"
+                elif 10 in extensions_tuple and quality == "min":
+                    effective_quality = "min7"
+                elif 10 in extensions_tuple and quality == "dom7":
+                    effective_quality = "dom7"
+                elif 9 in extensions_tuple and quality == "dim":
+                    effective_quality = "dim7"
+
                 # Add chord to score
                 section.chords.append(ScoreChord(
                     time_beats=chord_start,
                     duration_beats=chord_beats,
                     root_midi=root,
-                    quality=quality,
+                    quality=effective_quality,
                     label=label,
+                    extensions=extensions_tuple,
                 ))
 
                 # Bass note
@@ -289,6 +316,28 @@ class Composition:
         score.total_beats = beat_cursor
         return score
 
+    def _scale_ceiling(self, pitch: int, scale_pcs: list[int], max_midi: int) -> int:
+        """Find the nearest scale tone at or above `pitch`, up to max_midi.
+
+        Used to compute the melody floor above the harmony ceiling while
+        guaranteeing the result is diatonic.
+        """
+        pc = pitch % 12
+        if pc in scale_pcs:
+            candidate = pitch
+        else:
+            # Find nearest scale pitch class at or above this one
+            above = sorted(spc for spc in scale_pcs if spc > pc)
+            if above:
+                candidate = (pitch // 12) * 12 + above[0]
+            else:
+                # Wrap to next octave
+                candidate = (pitch // 12 + 1) * 12 + scale_pcs[0]
+        # If candidate is still below pitch (shouldn't happen), push up an octave
+        while candidate < pitch and candidate + 12 <= max_midi:
+            candidate += 12
+        return min(max_midi, candidate)
+
     def _add_melody_notes(
         self,
         section: Section,
@@ -313,11 +362,15 @@ class Composition:
         A's melodic motif (for A' section) with contour inversion.
 
         min_pitch: if set, all melody notes are shifted to be >= min_pitch
-        (used to prevent voice crossing with harmony in A').
+        (used to prevent voice crossing with harmony).  The value is pre-
+        computed by the caller as a scale-tone ceiling.
 
         Returns a list of (time_offset, duration, pitch) tuples representing
         the contour, for motif caching in A'.
         """
+        from .voice_leading import VOICE_RANGES
+        melody_range = VOICE_RANGES["melody"]
+
         if chord_beats <= 0:
             return []
 
@@ -333,7 +386,16 @@ class Composition:
 
         sub_beat = chord_beats / n_notes
 
-        # For motif reuse (A'): replay A's contour with rhythmic variation
+        # Build scale data once
+        scale = scale_degrees(self.root_midi, self.effective_mode)
+        scale_pcs = sorted(set(s % 12 for s in scale))
+
+        # Compute a DIATONIC min_pitch: nearest scale tone at or above the harmony ceiling
+        diatonic_min = None
+        if min_pitch is not None:
+            diatonic_min = self._scale_ceiling(min_pitch, scale_pcs, melody_range.max_midi)
+
+        # For motif reuse (A'): replay A's contour with variation
         if use_cached_contour and cached_contour is not None:
             contour_data = self._vary_melody_contour(cached_contour, n_notes, chord_root, chord_quality)
         else:
@@ -341,56 +403,76 @@ class Composition:
 
         if contour_data is not None:
             # Use the cached/varied contour (A' motif reuse)
-            # Shift notes above min_pitch by octave increments
-            if min_pitch is not None:
+            # Shift notes above the diatonic ceiling
+            if diatonic_min is not None:
                 shifted = []
                 for t_off, dur, pitch in contour_data:
-                    while pitch < min_pitch and pitch + 12 <= 127:
+                    while pitch < diatonic_min and pitch + 12 <= melody_range.max_midi:
                         pitch += 12
-                    if pitch < min_pitch:
-                        pitch = min_pitch
-                    shifted.append((t_off, dur, min(127, pitch)))
+                    if pitch < diatonic_min:
+                        # At the top of the range: quantize to nearest scale tone
+                        pitch = self._quantize_to_scale(diatonic_min, scale_pcs)
+                        pitch = max(diatonic_min, pitch)
+                    # Final safety: quantize again after octave shifts
+                    pitch = self._quantize_to_scale(pitch, scale_pcs)
+                    pitch = max(diatonic_min, pitch)
+                    shifted.append((t_off, dur, min(melody_range.max_midi, pitch)))
                 contour_data = shifted
-            for t_off, dur, pitch in contour_data:
-                t = chord_start + t_off
-                section.notes.append(ScoreNote(
-                    time_beats=t,
-                    duration_beats=dur,
-                    pitch_midi=pitch,
-                    amplitude=0.7,
-                    voice=VOICE_MELODY,
-                ))
+            contour_data = self._emit_melody(section, contour_data, chord_start, sub_beat)
             return contour_data
         else:
             # Generate contour anchored to voice-validated melody_pitch
             contour = self._melody_contour(n_notes, melody_pitch, chord_root, chord_quality,
                                            phrase_start=phrase_start, phrase_end=phrase_end)
 
-            # Final quantization pass: ensure ALL notes are diatonic
-            scale = scale_degrees(self.root_midi, self.effective_mode)
-            scale_pcs = sorted(set(s % 12 for s in scale))
+            # Enforce diatonic: quantize every note to scale
             contour = [self._quantize_to_scale(p, scale_pcs) for p in contour]
 
-            # Apply min_pitch shift (for A')
-            if min_pitch is not None:
-                contour = [p + 12 * ((min_pitch - p + 11) // 12) if p < min_pitch else p
-                           for p in contour]
-                contour = [min(127, p) for p in contour]
+            # Apply harmony ceiling (voice crossing prevention)
+            if diatonic_min is not None:
+                enforced = []
+                for p in contour:
+                    if p < diatonic_min:
+                        # Shift up by octaves until above ceiling
+                        p = p + 12 * ((diatonic_min - p + 11) // 12)
+                        if p > melody_range.max_midi:
+                            # Can't fit — use the ceiling itself
+                            p = diatonic_min
+                    # Quantize again after shift
+                    p = self._quantize_to_scale(p, scale_pcs)
+                    p = max(diatonic_min, p)
+                    p = min(melody_range.max_midi, p)
+                    enforced.append(p)
+                contour = enforced
 
+            # Build contour_data
             contour_data = []
             for i in range(n_notes):
-                t = chord_start + i * sub_beat
-                dur = sub_beat * self.mood.articulation
-                pitch = max(0, min(127, contour[i]))
-                section.notes.append(ScoreNote(
-                    time_beats=t,
-                    duration_beats=dur,
-                    pitch_midi=pitch,
-                    amplitude=0.7,
-                    voice=VOICE_MELODY,
-                ))
-                contour_data.append((i * sub_beat, dur, pitch))
+                pitch = contour[i]
+                pitch = max(0, min(127, pitch))
+                contour_data.append((i * sub_beat, sub_beat * self.mood.articulation, pitch))
+
+            contour_data = self._emit_melody(section, contour_data, chord_start, sub_beat)
             return contour_data
+
+    def _emit_melody(
+        self,
+        section: Section,
+        contour_data: list[tuple[float, float, int]],
+        chord_start: float,
+        sub_beat: float,
+    ) -> list[tuple[float, float, int]]:
+        """Create ScoreNotes from contour data."""
+        for t_off, dur, pitch in contour_data:
+            t = chord_start + t_off
+            section.notes.append(ScoreNote(
+                time_beats=t,
+                duration_beats=dur,
+                pitch_midi=pitch,
+                amplitude=0.7,
+                voice=VOICE_MELODY,
+            ))
+        return contour_data
 
     def _vary_melody_contour(
         self,
