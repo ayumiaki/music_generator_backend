@@ -42,9 +42,19 @@ def get_backend() -> BaseBackend:
 
 
 def process_job(queue, backend, item: QueueItem, worker_id: Optional[str] = None) -> None:
-    """Process a single job."""
+    """Process a single job.
+
+    Render-to-temp-then-rename strategy:
+    1. Render to .tmp.<worker_id>.<job_id>.wav
+    2. On success: atomic rename to <job_id>.wav
+    3. On failure: remove temp file (no partial artifact left behind)
+    """
     print(f"Processing job {item.job_id}: {item.prompt[:50]}...")
-    # Note: item.status is already "processing" from dequeue()
+
+    # Determine temp and final paths
+    from render_io import temp_path as _temp_path, final_path as _final_path, rename_to_final as _rename_to_final, cleanup_worker_temp as _cleanup
+    tmp = _temp_path(backend.output_dir, worker_id or "unknown", item.job_id)
+    final = _final_path(backend.output_dir, item.job_id)
 
     # Install alarm-based timeout before calling backend
     old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
@@ -59,26 +69,36 @@ def process_job(queue, backend, item: QueueItem, worker_id: Optional[str] = None
             key=item.key,
             length=item.length,
             seed=item.seed,
+            output_path=str(tmp),
         )
         signal.alarm(0)  # cancel alarm on success
         render_duration_ms = (time.perf_counter() - render_start) * 1000
         result["render_duration_ms"] = render_duration_ms
         if result.get("status") == "success":
+            # Atomic rename: temp -> final (overwrites if exists)
+            _rename_to_final(tmp, final)
+            result["output_file"] = str(final)
             queue.complete(item, result, worker_id=worker_id)
             print(f"Job {item.job_id} completed successfully")
         else:
+            # Backend failed — clean up temp, don't leave a partial
+            _cleanup(backend.output_dir, worker_id or "unknown")
             queue.fail(item, result.get("error", "Backend returned failure"), worker_id=worker_id)
             print(f"Job {item.job_id} failed: {result.get('error')}")
     except JobTimeoutError:
         signal.alarm(0)
         render_duration_ms = (time.perf_counter() - render_start) * 1000
         item.result["render_duration_ms"] = render_duration_ms
+        # Timeout — remove temp, job gets recovered later
+        _cleanup(backend.output_dir, worker_id or "unknown")
         queue.fail(item, f"Job exceeded timeout of {JOB_TIMEOUT}s", worker_id=worker_id)
         print(f"Job {item.job_id} timed out after {JOB_TIMEOUT}s")
     except Exception as e:
         signal.alarm(0)
         render_duration_ms = (time.perf_counter() - render_start) * 1000
         item.result["render_duration_ms"] = render_duration_ms
+        # Exception — remove temp, don't leave a partial
+        _cleanup(backend.output_dir, worker_id or "unknown")
         queue.fail(item, f"Worker exception: {str(e)}", worker_id=worker_id)
         print(f"Job {item.job_id} failed with exception: {e}")
     finally:
@@ -101,7 +121,8 @@ def main():
     worker_id = f"worker-{os.getpid()}"
 
     # Recover any jobs stuck in processing state after a crash
-    recovered = queue.recover()
+    # Pass output_dir so recover() can clean up orphaned .tmp.* files from dead workers
+    recovered = queue.recover(output_dir=str(backend.output_dir))
     if recovered:
         print(f"Recovered {len(recovered)} job(s) from previous crash")
         for item in recovered:

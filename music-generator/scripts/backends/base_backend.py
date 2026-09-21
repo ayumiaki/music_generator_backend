@@ -12,5 +12,5 @@ class BaseBackend(ABC):
         self.output_dir.mkdir(exist_ok=True)
 
     @abstractmethod
-    def generate(self, job_id: str, prompt: str, mood: str, tempo: int, key: str, length: int, seed: int | None = None) -> dict:
-        pass
+    def generate(self, job_id: str, prompt: str, mood: str, tempo: int, key: str, length: int, seed: int | None = None, output_path: str | None = None) -> dict:
+        """Generate audio. If output_path is given, write there; otherwise use default."""

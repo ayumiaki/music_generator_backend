@@ -659,46 +659,63 @@ class TestFileQueueRecoveryIntegration(QueueTestSuite):
 
 
     def test_worker_recovers_and_renders_valid_wav(self):
-        """Worker A claims & dies, Worker B recovers, renders, completes with valid WAV."""
+        """Worker A claims & dies, Worker B recovers, renders, completes with valid WAV.
+
+        Verifies the temp-file lifecycle:
+        - Worker A renders to .tmp.A.<job_id>.wav (simulated partial)
+        - On recover(), orphan temp files from dead workers are cleaned up
+        - Worker B renders to .tmp.B.<job_id>.wav, renames to <job_id>.wav
+        - Final artifact is a valid WAV, not a partial from A
+        """
         from backends.mock_backend import MockBackend
         from worker import process_job
+        from render_io import temp_path as _tmp
 
         tmpdir = self._make_shared_queue()
+        output_dir = os.path.join(tmpdir, "output")
+        os.makedirs(output_dir, exist_ok=True)
         q_a = FileQueue(queue_dir=tmpdir)
         q_b = FileQueue(queue_dir=tmpdir)
-        backend_b = MockBackend()
+        backend_b = MockBackend(output_dir=output_dir)
 
         # 1. Enqueue
         enqueue_item = self._make_item(seed=7)
         enqueue_item.length = 1
         job_id = q_a.enqueue(enqueue_item)
 
-        # 2. Worker A claims the job (but dies before rendering — we don't call process_job)
+        # 2. Worker A claims the job (but dies before rendering)
         claimed = q_a.dequeue(worker_id="worker-A")
         assert claimed is not None
         self.assertEqual(claimed.attempt, 1)
         self.assertEqual(claimed.worker_id, "worker-A")
-        self.assertEqual(claimed.status, "processing")
 
-        # 3. Worker A dies — job stuck in "processing"
-        stuck = q_a.get_item(job_id)
-        assert stuck is not None
-        self.assertEqual(stuck.status, "processing")
+        # 3. Simulate worker A's partial render: write a corrupt temp file
+        partial = _tmp(output_dir, "worker-A", job_id)
+        partial.write_bytes(b"PARTIAL_CORRUPT_NOT_WAV")
 
-        # 4. Worker B starts, recovers the stuck job
-        recovered = q_b.recover()
+        # 4. Worker A dies — job stuck in "processing", partial temp on disk
+        self.assertTrue(partial.exists(), "Simulated partial from worker A should exist")
+
+        # 5. Worker B recovers — recover() should clean up orphan temp from worker A
+        recovered = q_b.recover(output_dir=output_dir)
         self.assertEqual(len(recovered), 1)
 
-        # 5. Worker B reclaims via dequeue (attempt=2)
+        # CRITICAL: Worker A's partial must be gone after recovery
+        self.assertFalse(
+            partial.exists(),
+            f"Worker A's partial temp should be cleaned up after recover(): {partial}"
+        )
+
+        # 6. Worker B reclaims via dequeue (attempt=2)
         reclaimed = q_b.dequeue(worker_id="worker-B")
         assert reclaimed is not None
         self.assertEqual(reclaimed.attempt, 2)
         self.assertEqual(reclaimed.worker_id, "worker-B")
 
-        # 6. Worker B renders via the real process_job path
+        # 7. Worker B renders via process_job (temp -> atomic rename)
         process_job(q_b, backend_b, reclaimed, worker_id="worker-B")
 
-        # 7. Verify completion
+        # 8. Verify completion
         final = q_b.get_item(job_id)
         assert final is not None
         self.assertEqual(final.status, "completed")
@@ -706,7 +723,7 @@ class TestFileQueueRecoveryIntegration(QueueTestSuite):
         self.assertEqual(final.worker_id, "worker-B")
         self.assertEqual(final.attempt, 2)
 
-        # 8. Verify valid artifact with WAV header
+        # 9. Verify final artifact is a valid WAV (not the corrupt partial)
         output_file = final.result.get("output_file") if final.result else None
         self.assertIsNotNone(output_file, "output_file should be set in result")
         assert output_file is not None
@@ -720,7 +737,24 @@ class TestFileQueueRecoveryIntegration(QueueTestSuite):
             f"Artifact should have valid WAV header: {output_file}"
         )
 
-        # 9. Queue clean
+        # Verify the output is at the final path, not a temp path
+        self.assertEqual(Path(output_file).name, f"{job_id}.wav")
+        self.assertFalse(Path(output_file).name.startswith(".tmp."))
+
+        # 10. Worker B's temp file should be gone (renamed to final)
+        worker_b_tmp = _tmp(output_dir, "worker-B", job_id)
+        self.assertFalse(
+            worker_b_tmp.exists(),
+            f"Worker B's temp file should not exist after atomic rename: {worker_b_tmp}"
+        )
+
+        # 11. Exactly one WAV artifact, no temp files left in output dir
+        wav_files = list(Path(output_dir).glob("*.wav"))
+        tmp_files = list(Path(output_dir).glob(".tmp.*"))
+        self.assertEqual(len(wav_files), 1, f"Should be exactly 1 WAV, got {wav_files}")
+        self.assertEqual(len(tmp_files), 0, f"No temp files should remain, got {tmp_files}")
+
+        # 12. Queue clean
         depth = q_b.depth()
         self.assertEqual(depth["total_active"], 0)
 
@@ -748,6 +782,106 @@ class TestFileQueueRecoveryIntegration(QueueTestSuite):
             retried = q.dequeue(worker_id="worker-C")
             assert retried is not None
             self.assertEqual(retried.attempt, 3)
+
+    def test_evidence_chain_full(self):
+        """Print the full evidence table for recovery verification.
+
+        Collects all fields TARS requested:
+        - original worker_id
+        - replacement worker_id
+        - attempt count
+        - PEL (depth) before recovery
+        - PEL (depth) after completion
+        - artifact count (WAV files in output dir)
+        - WAV header validity
+        - queue depth (total_active)
+        """
+        from backends.mock_backend import MockBackend
+        from worker import process_job
+        from render_io import temp_path as _tmp
+
+        tmpdir = self._make_shared_queue()
+        output_dir = os.path.join(tmpdir, "output")
+        os.makedirs(output_dir, exist_ok=True)
+        q_a = FileQueue(queue_dir=tmpdir)
+        q_b = FileQueue(queue_dir=tmpdir)
+        backend_b = MockBackend(output_dir=output_dir)
+
+        # Enqueue
+        enqueue_item = self._make_item(seed=42)
+        enqueue_item.length = 1
+        job_id = q_a.enqueue(enqueue_item)
+
+        # Worker A claims
+        claimed = q_a.dequeue(worker_id="worker-A")
+        assert claimed is not None
+        original_worker_id = claimed.worker_id
+
+        # Simulate worker A's partial render
+        partial = _tmp(output_dir, "worker-A", job_id)
+        partial.write_bytes(b"PARTIAL_NOT_WAV")
+
+        # PEL before recovery = queue depth with processing job
+        pel_before = q_a.depth()
+
+        # Worker B recovers (also cleans up worker A's temp)
+        recovered = q_b.recover(output_dir=output_dir)
+        self.assertEqual(len(recovered), 1)
+
+        # Verify partial from A is cleaned up
+        self.assertFalse(partial.exists())
+
+        # Replacement worker reclaims
+        reclaimed = q_b.dequeue(worker_id="worker-B")
+        assert reclaimed is not None
+        replacement_worker_id = reclaimed.worker_id
+        final_attempt = reclaimed.attempt
+
+        # Worker B renders
+        process_job(q_b, backend_b, reclaimed, worker_id="worker-B")
+
+        # PEL after completion
+        pel_after = q_b.depth()
+
+        # Artifact count
+        wav_count = len(list(Path(output_dir).glob("*.wav")))
+        tmp_count = len(list(Path(output_dir).glob(".tmp.*")))
+
+        # WAV header validity
+        final = q_b.get_item(job_id)
+        assert final is not None
+        output_file = final.result.get("output_file") if final.result else None
+        assert output_file is not None
+        wav_valid = _validate_wav_header(output_file)
+
+        # Queue depth
+        final_depth = q_b.depth()["total_active"]
+
+        # Pretty-print the evidence table
+        print("\n" + "=" * 60)
+        print("EVIDENCE CHAIN — WORKER RECOVERY")
+        print("=" * 60)
+        print(f"  original worker_id     : {original_worker_id}")
+        print(f"  replacement worker_id  : {replacement_worker_id}")
+        print(f"  attempt count          : {final_attempt}")
+        print(f"  PEL before recovery    : {pel_before}")
+        print(f"  PEL after completion   : {pel_after}")
+        print(f"  artifact count (WAV)   : {wav_count}")
+        print(f"  temp files remaining   : {tmp_count}")
+        print(f"  WAV header valid       : {wav_valid}")
+        print(f"  queue depth            : {final_depth}")
+        print("=" * 60)
+
+        # Assertions to close the evidence chain
+        self.assertEqual(original_worker_id, "worker-A")
+        self.assertEqual(replacement_worker_id, "worker-B")
+        self.assertEqual(final_attempt, 2)
+        self.assertEqual(pel_before.get("processing", 0), 1)
+        self.assertEqual(pel_after["total_active"], 0)
+        self.assertEqual(wav_count, 1)
+        self.assertEqual(tmp_count, 0)
+        self.assertTrue(wav_valid)
+        self.assertEqual(final_depth, 0)
 
 
 def _validate_wav_header(path: str) -> bool:

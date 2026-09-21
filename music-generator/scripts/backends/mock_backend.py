@@ -11,8 +11,11 @@ from config import MOCK_MIN_DELAY, MOCK_MAX_DELAY
 
 
 class MockBackend(BaseBackend):
-    def __init__(self):
+    def __init__(self, output_dir: str | None = None):
         super().__init__()
+        if output_dir:
+            self.output_dir = Path(output_dir)
+            self.output_dir.mkdir(parents=True, exist_ok=True)
         # Lazy-import numpy/scipy so module loads without them
         self._can_generate_audio = False
         try:
@@ -22,7 +25,7 @@ class MockBackend(BaseBackend):
         except ImportError:
             pass
 
-    def generate(self, job_id: str, prompt: str, mood: str, tempo: int, key: str, length: int, seed: int | None = None) -> dict:
+    def generate(self, job_id: str, prompt: str, mood: str, tempo: int, key: str, length: int, seed: int | None = None, output_path: str | None = None) -> dict:
         # Lazy-import numpy for random delay
         np = None
         if self._can_generate_audio:
@@ -39,7 +42,7 @@ class MockBackend(BaseBackend):
             delay = 0.01
         time.sleep(delay)
 
-        output_file = self.output_dir / f"{job_id}.wav"
+        output_file = Path(output_path) if output_path else self.output_dir / f"{job_id}.wav"
 
         if self._can_generate_audio:
             try:
