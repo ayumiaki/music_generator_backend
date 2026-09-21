@@ -210,15 +210,16 @@ def _bass_alternatives(v: Voicing, bass_range: VoiceRange, root: int) -> list[in
     """Generate alternative bass pitches for the same chord root.
 
     The bass is normally the root in the range's sweet spot, but for
-    parallel avoidance we may need an octave displacement.
+    parallel avoidance we may need an octave displacement or inversion.
     """
     alts = [v.bass]
-    if v.bass + 12 <= bass_range.max_midi:
-        alts.append(v.bass + 12)
-    if v.bass - 12 >= bass_range.min_midi:
-        alts.append(v.bass - 12)
-    # Include third or fifth in bass (inversion) as last resort
-    for iv in [4, 7, -5, -8]:
+    # Octave displacements
+    for oct_shift in [12, -12, 24, -24]:
+        p = v.bass + oct_shift
+        if bass_range.min_midi <= p <= bass_range.max_midi and p not in alts:
+            alts.append(p)
+    # Inversions: third or fifth in bass
+    for iv in [4, 7, -5, -8, 3, -4, -9]:
         p = root + iv
         if bass_range.min_midi <= p <= bass_range.max_midi and p not in alts:
             alts.append(p)
@@ -258,13 +259,13 @@ def _try_avoid_parallels(
 
     # Exhaustive bounded search (bass × h0 × h1 × melody)
     for alt_b in bass_alts:
-        for alt_h0 in h0_alts[:8]:
-            for alt_h1 in h1_alts[:8]:
+        for alt_h0 in h0_alts[:12]:
+            for alt_h1 in h1_alts[:12]:
                 if alt_h0 >= alt_h1:
                     continue
                 if alt_b > alt_h0:
                     continue
-                for alt_m in m_alts[:6]:
+                for alt_m in m_alts[:8]:
                     if alt_m <= alt_h1:
                         continue
                     alt_v = Voicing(
