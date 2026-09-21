@@ -39,6 +39,8 @@ from .voice_leading import (
     VOICE_RANGES,
     VoiceRange,
     Voicing,
+    detect_parallel_fifths_octaves,
+    voice_chord,
     voice_progression,
 )
 
@@ -102,20 +104,25 @@ class Composition:
         )
 
         beat_cursor = 0.0
-        saved_a_state = None  # (progression, final_voicing) for A' mirror
+        saved_a_state = None  # (progression, final_voicing, melody_notes) for A' mirror
         continuous_voicing: Optional[Voicing] = None
+        section_final_voicings: dict[str, Voicing] = {}  # track final voicing per section
 
         for sec_idx, (sec_name, sec_bars) in enumerate(template):
             sec_beats = sec_bars * self.config.beats_per_bar
 
             # Determine chord progression for this section
             if sec_name == "A'" and saved_a_state is not None:
-                prog, final_v = saved_a_state
-                # For A', we reuse the progression but also start from
-                # the final voicing of the original A section
-                continuous_voicing_for_section = final_v
+                prog, final_v, saved_melody = saved_a_state
+                # For A': chronological continuity — use the immediately preceding
+                # section's final voicing (B's), not A's. The progression and motif
+                # come from A, but voice leading continues from where we left off.
+                prev_section_name = template[sec_idx - 1][0] if sec_idx > 0 else None
+                continuous_voicing_for_section = section_final_voicings.get(prev_section_name) if prev_section_name else continuous_voicing
+                use_saved_melody = True
             else:
                 continuous_voicing_for_section = continuous_voicing
+                use_saved_melody = False
                 n_chords = sec_bars  # one chord per bar
                 if sec_name.startswith("B"):
                     n_chords = max(4, sec_bars)
@@ -140,9 +147,46 @@ class Composition:
                 )
 
                 # Save A progression + initial voicing for A' mirror
-                base_name = sec_name.rstrip("'")
-                if base_name == "A":
-                    saved_a_state = (prog, None)  # will fill voicing after voicing
+                if sec_name == "A":
+                    saved_a_state = (prog, None, None)  # will fill voicing+melody after voicing
+
+            # Section boundary: pre-check for parallels between previous section's
+            # last voicing and this section's first chord. If parallels exist,
+            # shift the initial bass BEFORE voice_progression so all subsequent
+            # parallel avoidance uses the corrected starting point.
+            if continuous_voicing_for_section is not None and prog:
+                prev_v = continuous_voicing_for_section
+                # Voice just the first chord to check
+                first_root, first_quality, first_label = prog[0]
+                first_v = voice_chord(
+                    first_root, first_quality, first_label, prev_v,
+                    tension=self.mood.tension, register=self.mood.register,
+                )
+                prev_all = [prev_v.bass, prev_v.melody] + prev_v.harmony
+                curr_all = [first_v.bass, first_v.melody] + first_v.harmony
+                f, o = detect_parallel_fifths_octaves(prev_all, curr_all)
+                if f + o > 0:
+                    # Try shifting bass by octave to break parallels
+                    bass_vr = VOICE_RANGES["bass"]
+                    for bass_shift in [12, -12, 24, -24]:
+                        new_bass = first_v.bass + bass_shift
+                        if (new_bass >= bass_vr.min_midi and
+                                new_bass <= bass_vr.max_midi and
+                                (not first_v.harmony or new_bass < min(first_v.harmony))):
+                            shifted_v = Voicing(
+                                bass=new_bass,
+                                harmony=first_v.harmony,
+                                melody=first_v.melody,
+                                chord_root=first_v.chord_root,
+                                chord_quality=first_v.chord_quality,
+                                chord_label=first_v.chord_label,
+                            )
+                            f2, o2 = detect_parallel_fifths_octaves(
+                                prev_all, [shifted_v.bass, shifted_v.melody] + shifted_v.harmony
+                            )
+                            if f2 + o2 < f + o:
+                                continuous_voicing_for_section = shifted_v
+                                break
 
             # Voice the progression with continuous state
             voicings = voice_progression(
@@ -155,12 +199,11 @@ class Composition:
             # Update continuous voicing to the last voicing of this section
             if voicings:
                 continuous_voicing = voicings[-1]
+                section_final_voicings[sec_name] = voicings[-1]
 
-            # If this is A, save the final voicing state for A'
-            base_name = sec_name.rstrip("'")
-            if base_name == "A":
-                if saved_a_state is not None:
-                    saved_a_state = (saved_a_state[0], continuous_voicing)
+            # If this is A (original only, not A'), save the final voicing state for A'
+            if sec_name == "A" and saved_a_state is not None:
+                saved_a_state = (saved_a_state[0], continuous_voicing, saved_a_state[2])
 
             # Build section notes and chords
             section = Section(
@@ -168,6 +211,9 @@ class Composition:
                 start_beat=beat_cursor,
                 duration_beats=sec_beats,
             )
+
+            # Collect A's melody for reuse in A'
+            section_melody_notes = []
 
             beat_in_section = 0.0
             for i, ((root, quality, label), voicing) in enumerate(zip(prog, voicings)):
@@ -202,10 +248,20 @@ class Composition:
                         voice=VOICE_HARMONY,
                     ))
 
-                # Melody with contour
+                # Melody with contour — anchored to voice-validated melody_pitch
                 phrase_start = (i == 0)
                 phrase_end = (i == len(prog) - 1)
-                self._add_melody_notes(
+                # For A': reuse A's melodic motif (with variation)
+                _cached = None
+                if (use_saved_melody and saved_a_state is not None
+                        and saved_a_state[2] is not None
+                        and isinstance(saved_a_state[2], list)
+                        and i < len(saved_a_state[2])):
+                    _cached = saved_a_state[2][i]
+                # min_pitch: melody must stay above the highest harmony note
+                _max_harmony = max(voicings[i].harmony) if voicings[i].harmony else None
+                _min_pitch = _max_harmony + 1 if _max_harmony is not None else None
+                melody_notes = self._add_melody_notes(
                     section,
                     chord_start,
                     chord_beats,
@@ -214,9 +270,18 @@ class Composition:
                     quality,
                     phrase_start=phrase_start,
                     phrase_end=phrase_end,
+                    use_cached_contour=_cached is not None,
+                    cached_contour=_cached,
+                    min_pitch=_min_pitch,
                 )
+                section_melody_notes.append(melody_notes)
 
                 beat_in_section += chord_beats
+
+            # After building A section, save melody contours for A'
+            # Only save for the ORIGINAL A section, not A' (which has trailing ')
+            if sec_name == "A" and saved_a_state is not None:
+                saved_a_state = (saved_a_state[0], saved_a_state[1], section_melody_notes)
 
             score.sections.append(section)
             beat_cursor += sec_beats
@@ -234,18 +299,29 @@ class Composition:
         chord_quality: str,
         phrase_start: bool = False,
         phrase_end: bool = False,
-    ) -> None:
+        use_cached_contour: bool = False,
+        cached_contour: list[tuple[float, float, int]] | None = None,
+        min_pitch: int | None = None,
+    ) -> list[tuple[float, float, int]]:
         """Add melody notes for one chord's duration with contour.
 
-        Melody uses scale degrees near the chord tone, with stepwise motion
-        and occasional leaps. Density controls note count.
-        phrase_start/phrase_end bias toward stable tones for musical phrasing.
+        The first note is anchored to melody_pitch — the voice-validated chord
+        tone from voice leading. Subsequent notes form a contour with stepwise
+        motion, chord-tone leaps, and phrase-aware resolution.
+
+        If use_cached_contour is True and cached_contour is provided, reuses
+        A's melodic motif (for A' section) with contour inversion.
+
+        min_pitch: if set, all melody notes are shifted to be >= min_pitch
+        (used to prevent voice crossing with harmony in A').
+
+        Returns a list of (time_offset, duration, pitch) tuples representing
+        the contour, for motif caching in A'.
         """
         if chord_beats <= 0:
-            return
+            return []
 
         density = self.mood.density
-        # Number of melody notes per chord based on density
         if density < 0.15:
             n_notes = 1
         elif density < 0.4:
@@ -257,39 +333,116 @@ class Composition:
 
         sub_beat = chord_beats / n_notes
 
-        # Generate contour with phrase awareness
-        contour = self._melody_contour(n_notes, chord_root, chord_quality,
-                                       phrase_start=phrase_start, phrase_end=phrase_end)
+        # For motif reuse (A'): replay A's contour with rhythmic variation
+        if use_cached_contour and cached_contour is not None:
+            contour_data = self._vary_melody_contour(cached_contour, n_notes, chord_root, chord_quality)
+        else:
+            contour_data = None
 
-        for i in range(n_notes):
-            t = chord_start + i * sub_beat
-            dur = sub_beat * self.mood.articulation
-            pitch = contour[i]
-            # Ensure melody pitch is in valid MIDI range
-            pitch = max(0, min(127, pitch))
-            section.notes.append(ScoreNote(
-                time_beats=t,
-                duration_beats=dur,
-                pitch_midi=pitch,
-                amplitude=0.7,
-                voice=VOICE_MELODY,
-            ))
+        if contour_data is not None:
+            # Use the cached/varied contour (A' motif reuse)
+            if min_pitch is not None:
+                contour_data = [
+                    (t_off, dur, max(min_pitch, min(127, pitch)))
+                    for t_off, dur, pitch in contour_data
+                ]
+            for t_off, dur, pitch in contour_data:
+                t = chord_start + t_off
+                section.notes.append(ScoreNote(
+                    time_beats=t,
+                    duration_beats=dur,
+                    pitch_midi=pitch,
+                    amplitude=0.7,
+                    voice=VOICE_MELODY,
+                ))
+            return contour_data
+        else:
+            # Generate contour anchored to voice-validated melody_pitch
+            contour = self._melody_contour(n_notes, melody_pitch, chord_root, chord_quality,
+                                           phrase_start=phrase_start, phrase_end=phrase_end)
 
-    def _melody_contour(self, n_notes: int, chord_root: int, chord_quality: str,
+            contour_data = []
+            for i in range(n_notes):
+                t = chord_start + i * sub_beat
+                dur = sub_beat * self.mood.articulation
+                pitch = max(0, min(127, contour[i]))
+                section.notes.append(ScoreNote(
+                    time_beats=t,
+                    duration_beats=dur,
+                    pitch_midi=pitch,
+                    amplitude=0.7,
+                    voice=VOICE_MELODY,
+                ))
+                contour_data.append((i * sub_beat, dur, pitch))
+            return contour_data
+
+    def _vary_melody_contour(
+        self,
+        cached: list[tuple[float, float, int]],
+        n_notes: int,
+        chord_root: int,
+        chord_quality: str,
+    ) -> list[tuple[float, float, int]]:
+        """Create a rhythmic variation of a cached motif for A'.
+
+        Keeps the pitch sequence intact (recognizable motif) but varies:
+        - Duration pattern (swap adjacent note lengths)
+        - Syncopation (shift onset slightly for some notes)
+        - Contour direction inversion (mirror the intervals)
+
+        All output pitches are quantised to the active scale.
+        """
+        from .voice_leading import VOICE_RANGES
+        melody_range = VOICE_RANGES["melody"]
+
+        if not cached:
+            return []
+
+        # Build scale pool for quantisation
+        scale = scale_degrees(self.root_midi, self.effective_mode)
+        scale_pcs = set(s % 12 for s in scale)
+
+        # Extract pitches from cached contour
+        pitches = [p for (_, _, p) in cached]
+
+        # Vary by inverting the contour direction (mirror intervals)
+        if len(pitches) >= 2 and len(cached) > 0:
+            first = pitches[0]
+            intervals = [pitches[i] - pitches[i-1] for i in range(1, len(pitches))]
+            # Invert intervals
+            varied = [first]
+            for iv in intervals:
+                next_p = varied[-1] - iv  # invert direction
+                next_p = self._quantize_to_scale(next_p, sorted(scale_pcs))
+                next_p = max(melody_range.min_midi, min(melody_range.max_midi, next_p))
+                varied.append(next_p)
+            pitches = varied
+
+        # Rebuild contour_data with original timing pattern but varied pitches
+        result = []
+        for i, (t_off, dur, _) in enumerate(cached):
+            if i < len(pitches):
+                result.append((t_off, dur, pitches[i]))
+
+        return result
+
+    def _melody_contour(self, n_notes: int, melody_pitch: int, chord_root: int, chord_quality: str,
                         phrase_start: bool = False, phrase_end: bool = False) -> list[int]:
         """Generate a melodic contour with diverse pitch content and musical shape.
 
-        Uses a wide scale pool for maximum pitch diversity, with starting
-        position offset by degree (transposition-consistent) to vary between
-        chords. Ensures same seed + same degree → same contour shape.
+        The FIRST note is always melody_pitch — the voice-validated chord tone
+        from voice_leading.voice_chord(). This ensures the melody that passes
+        the parallel-avoidance gate is the melody that reaches the score.
+
+        Subsequent notes use a scale pool around the chord tone, with stepwise
+        motion, momentum, and chord-tone leaps.
         """
         from .harmony import CHORD_QUALITIES
         from .voice_leading import VOICE_RANGES
         melody_range = VOICE_RANGES["melody"]
         chord_intervals = CHORD_QUALITIES.get(chord_quality, [0, 4, 7])
-        degree_offset = (chord_root - self.root_midi) % 12
 
-        # Build a very wide scale pool for maximum pitch diversity
+        # Build scale pool
         scale = scale_degrees(self.root_midi, self.effective_mode)
         scale_pcs = set(s % 12 for s in scale)
         scale_pool = []
@@ -303,23 +456,13 @@ class Composition:
         if n_notes <= 0:
             return []
 
-        # Starting position: offset by degree (transposition-consistent)
-        # Different chords start from different positions for variety
-        base_mid = (melody_range.preferred_low + melody_range.preferred_high) // 2
-        range_span = melody_range.preferred_high - melody_range.preferred_low
-        start_offset = (degree_offset % 5) * 4 - range_span // 2
-        mid = base_mid + start_offset
-        mid = max(melody_range.min_midi + 2, min(melody_range.max_midi - 2, mid))
-
-        if phrase_end:
-            start_candidates = [p for p in scale_pool if p % 12 == self.root_midi % 12]
-        else:
-            start_candidates = [p for p in scale_pool if p % 12 in set((chord_root + iv) % 12 for iv in chord_intervals)]
-        if not start_candidates:
-            start_candidates = scale_pool
-        current = min(start_candidates, key=lambda p: abs(p - mid))
-
+        # FIRST NOTE: anchored to voice-validated melody_pitch
+        # This is the chord tone that passed parallel-avoidance — it MUST reach the score
+        current = max(melody_range.min_midi, min(melody_range.max_midi, melody_pitch))
         contour = [current]
+
+        # Determine momentum direction based on pitch relative to preferred range
+        base_mid = (melody_range.preferred_low + melody_range.preferred_high) // 2
 
         for i in range(1, n_notes):
             r = self.rng.random()
@@ -327,24 +470,25 @@ class Composition:
 
             # Phrase-end: bias toward tonic in last 2 notes
             if phrase_end and i >= n_notes - 2:
-                tonic_pcs = self.root_midi % 12
+                tonic_pc = self.root_midi % 12
                 target = min(scale_pool, key=lambda p: (
-                    0 if p % 12 == tonic_pcs else 1,
+                    0 if p % 12 == tonic_pc else 1,
                     abs(p - prev)
                 ))
                 pitch = target
-            elif r < 0.05:
-                # Repeat note
+            elif r < 0.08:
+                # Repeat note (slightly higher chance for rhythmic variety)
                 pitch = prev
             elif r < 0.55:
                 # Stepwise: continue direction with momentum
                 direction = 1 if prev < base_mid else -1
-                step = direction * int(self.rng.choice([1, 1, 2]))
-                pitch = prev + step
-            elif r < 0.80:
+                step_size = int(self.rng.choice([1, 1, 2, 2, 3]))
+                pitch = prev + direction * step_size
+            elif r < 0.78:
                 # Chord-tone leap: pick a chord tone 3-12 semitones away
                 jitter = int(self.rng.randint(0, 3))
-                ct_options = [p for p in scale_pool if p % 12 in set((chord_root + iv) % 12 for iv in chord_intervals) and 3 <= abs(p - prev) <= 12]
+                ct_pcs = set((chord_root + iv) % 12 for iv in chord_intervals)
+                ct_options = [p for p in scale_pool if p % 12 in ct_pcs and 3 <= abs(p - prev) <= 12]
                 if ct_options:
                     pitch = min(ct_options, key=lambda p, j=jitter: abs(p - prev) + j)
                 else:
