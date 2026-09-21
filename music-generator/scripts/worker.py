@@ -32,6 +32,9 @@ def get_backend() -> BaseBackend:
     if BACKEND_TYPE == "mock":
         from backends.mock_backend import MockBackend
         return MockBackend()
+    elif BACKEND_TYPE == "synth":
+        from backends.synth_backend import SynthBackend
+        return SynthBackend()
     else:
         raise NotImplementedError(f"Backend type '{BACKEND_TYPE}' not implemented")
 

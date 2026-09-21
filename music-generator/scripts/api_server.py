@@ -19,13 +19,18 @@ from flask import Flask, request, jsonify, send_file
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from config import OUTPUT_DIR, QUEUE_DIR, HOST, PORT, MG_API_TOKEN
+from config import OUTPUT_DIR, QUEUE_DIR, HOST, PORT, MG_API_TOKEN, BACKEND_TYPE
 from job_queue import FileQueue, QueueItem
-from backends.mock_backend import MockBackend
 
 app = Flask(__name__)
 queue = FileQueue()
-backend = MockBackend()
+
+if BACKEND_TYPE == "synth":
+    from backends.synth_backend import SynthBackend
+    backend = SynthBackend()
+else:
+    from backends.mock_backend import MockBackend
+    backend = MockBackend()
 
 def _check_auth() -> bool:
     token = os.environ.get("MG_API_TOKEN", MG_API_TOKEN or "")
@@ -45,7 +50,8 @@ def _require_auth():
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({"status": "ok", "queue": "file", "backend": "mock"})
+    backend_type = "synth" if BACKEND_TYPE == "synth" else "mock"
+    return jsonify({"status": "ok", "queue": "file", "backend": backend_type})
 
 def _validate_int(value, field_name, min_val=None, max_val=None):
     """Validate and convert a value to int, returning (error_dict, status_code) or (None, int_value)."""
