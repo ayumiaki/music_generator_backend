@@ -1,7 +1,7 @@
 """Synth package exports."""
 from .oscillator import WavetableOscillator, make_wavetable
 from .envelope import ADSREnvelope
-from .filter import LadderFilter
+from .filter import CascadeFilter
 from .voice import VoiceEngine, VoiceConfig
 from .drums import DrumPattern
 from .arrangement import Arrangement, ArrangementConfig

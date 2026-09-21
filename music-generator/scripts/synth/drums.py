@@ -99,12 +99,24 @@ class DrumPattern:
         kick_pattern: str = "four_on_floor",
         snare_pattern: str = "backbeat",
         hihat_pattern: str = "eighth",
+        total_samples: int | None = None,
     ) -> NDArray[np.float64]:
-        """Render drum pattern for given bars with multi-bar scheduling."""
+        """Render drum pattern for given bars with multi-bar scheduling.
+
+        If total_samples is given, the output is exactly that long:
+        enough bars are rendered to cover it, then the buffer is trimmed
+        to the exact frame count.
+        """
         beats_per_bar = 4
+        requested = total_samples
+        if requested is not None and requested >= 0:
+            # Render enough bars to cover requested samples
+            bar_samples = self._beat_to_samples(beats_per_bar)
+            bars = max(1, -(-requested // max(bar_samples, 1)))  # ceil
         total_beats = bars * beats_per_bar
-        total_samples = int(total_beats * self.beat_duration * self.sample_rate)
-        output = np.zeros(total_samples, dtype=np.float64)
+        buffer_samples = int(total_beats * self.beat_duration * self.sample_rate)
+        buf_len = max(buffer_samples, requested or 0)
+        output = np.zeros(buf_len, dtype=np.float64)
 
         # Render each bar with per-bar sample offset
         for bar in range(bars):
@@ -115,22 +127,26 @@ class DrumPattern:
             kick_dur = int(0.1 * self.sample_rate)
             for beat in _KICK_PATTERNS.get(kick_pattern, _KICK_PATTERNS["four_on_floor"]):
                 start = bar_sample_offset + self._beat_to_samples(beat)
-                if start + kick_dur <= total_samples:
+                if start + kick_dur <= buf_len:
                     output[start : start + kick_dur] += _kick(kick_dur, self.sample_rate) * 0.8
 
             # Render snare
             snare_dur = int(0.15 * self.sample_rate)
             for beat in _SNARE_PATTERNS.get(snare_pattern, _SNARE_PATTERNS["backbeat"]):
                 start = bar_sample_offset + self._beat_to_samples(beat)
-                if start + snare_dur <= total_samples:
+                if start + snare_dur <= buf_len:
                     output[start : start + snare_dur] += _snare(snare_dur, self.sample_rate, self._rng) * 0.6
 
             # Render hihat
             hihat_dur = int(0.05 * self.sample_rate)
             for beat in _HIHAT_PATTERNS.get(hihat_pattern, _HIHAT_PATTERNS["eighth"]):
                 start = bar_sample_offset + self._beat_to_samples(beat)
-                if start + hihat_dur <= total_samples:
+                if start + hihat_dur <= buf_len:
                     output[start : start + hihat_dur] += _hihat(hihat_dur, self.sample_rate, self._rng) * 0.4
+
+        # Trim to the exact requested length
+        if requested is not None and len(output) > requested:
+            output = output[:requested]
 
         # Prevent clipping
         max_val = np.max(np.abs(output)) if len(output) > 0 else 1.0

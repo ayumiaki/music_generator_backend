@@ -1,36 +1,32 @@
-"""Stable 4-pole lowpass filter — cascade of four one-pole lowpasses.
+"""Stable 4-pole lowpass filter — cascade of four calibrated one-pole stages.
 
 Each one-pole stage: y[n] = y[n-1] + alpha * (x[n] - y[n-1])
-where alpha = 1 - exp(-2*pi*fc/fs)
 
-Cascading four identical stages gives a 4-pole response (24 dB/octave)
-with no resonance peak. This is numerically stable for all cutoff
-frequencies — no TPT/ZDF coefficient explosions, no state resets.
+Per-stage alpha is calibrated so the four-stage cascade measures -3 dB at
+the requested cutoff (each stage contributes magnitude 2^(-1/8) there).
 
-The trade-off: no resonance control. If resonance is needed, it must
-be added as a separate stage (e.g., a resonant one-pole with feedback).
+This filter has NO resonance — it is a plain cascade, not a ladder.
+There is no resonance parameter because there is no resonance.
 """
 import numpy as np
 from numpy.typing import NDArray
 
 
-class LadderFilter:
-    """4-pole lowpass filter via cascaded one-pole stages.
+class CascadeFilter:
+    """4-pole lowpass filter via cascaded calibrated one-pole stages.
 
-    Topology: four one-pole lowpass stages in series. Unconditionally stable.
-    - cutoff: 20–22050 Hz (for 48kHz sample rate)
-    - resonance: 0.0 (not implemented — this is a stability fallback)
+    Topology: four one-pole lowpass stages in series. Unconditionally
+    stable for all cutoffs in [1, fs/2]. The composite -3 dB point is
+    calibrated to the requested cutoff frequency.
     """
 
     def __init__(
         self,
         sample_rate: int = 48000,
         cutoff: float = 20000.0,
-        resonance: float = 0.0,
     ) -> None:
         self.sample_rate = sample_rate
         self.cutoff = cutoff
-        self.resonance = resonance
         # Four one-pole stage states
         self._s1 = 0.0
         self._s2 = 0.0
@@ -45,9 +41,6 @@ class LadderFilter:
 
     def set_cutoff(self, cutoff: float) -> None:
         self.cutoff = max(1.0, min(cutoff, self.sample_rate / 2.0))
-
-    def set_resonance(self, resonance: float) -> None:
-        self.resonance = max(0.0, min(resonance, 1.0))
 
     def _compute_alpha(self) -> float:
         """Compute per-stage alpha for calibrated composite cutoff.

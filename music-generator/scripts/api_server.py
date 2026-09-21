@@ -97,10 +97,10 @@ def generate():
     if tempo is None:
         return jsonify({"error": "tempo is required"}), 400
 
-    # Validate seed if provided
+    # Validate seed if provided: must be an integer in [0, 2^32-1]
     seed = None
     if seed_raw is not None:
-        err, seed = _validate_int(seed_raw, "seed")
+        err, seed = _validate_int(seed_raw, "seed", 0, 2**32 - 1)
         if err:
             return jsonify(err), 400
 

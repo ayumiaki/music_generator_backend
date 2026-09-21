@@ -13,7 +13,7 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 from .oscillator import WavetableOscillator, make_wavetable
 from .envelope import ADSREnvelope
-from .filter import LadderFilter
+from .filter import CascadeFilter
 from .voice import VoiceEngine, VoiceConfig
 from .drums import DrumPattern
 from .arrangement import Arrangement, ArrangementConfig
@@ -35,7 +35,6 @@ class SynthConfig:
     sustain_level: float = 0.7
     release_samples: int = 4800
     filter_cutoff: float = 20000.0
-    filter_resonance: float = 0.0
     retrigger: bool = True
     seed: int | None = None
     output_dir: str = "output"
@@ -76,7 +75,6 @@ class SynthEngine:
                 sustain_level=self.config.sustain_level,
                 release_samples=self.config.release_samples,
                 filter_cutoff=self.config.filter_cutoff,
-                filter_resonance=self.config.filter_resonance,
                 retrigger=self.config.retrigger,
                 seed=self.config.seed,
             )
@@ -126,24 +124,42 @@ class SynthEngine:
         self._hihat_pattern = hihat_pattern
 
     def render(self, output_path: Optional[str | Path] = None) -> RenderIntegrity:
-        """Render the arrangement + drums to PCM. Optionally write WAV."""
+        """Render the arrangement + drums to PCM. Optionally write WAV.
+
+        The final mix is exactly the requested number of frames:
+        int(length * sample_rate) when length > 0, else bars-derived.
+        """
+        # Exact target frame count
+        total_samples = self._arrangement.get_total_samples()
+
         # Render arrangement
         audio = self._arrangement.render()
 
-        # Render drums and mix
+        # Render drums and mix, trimmed to the exact target length
         if self._drum_bars > 0:
             drums = self._drums.render(
                 bars=self._drum_bars,
                 kick_pattern=self._kick_pattern,
                 snare_pattern=self._snare_pattern,
                 hihat_pattern=self._hihat_pattern,
+                total_samples=total_samples,
             )
-            # Mix drums at lower volume
-            if len(drums) > len(audio):
-                audio = np.pad(audio, (0, len(drums) - len(audio)))
-            elif len(audio) > len(drums):
-                drums = np.pad(drums, (0, len(audio) - len(drums)))
-            audio = audio + drums * 0.5
+            # Mix drums at lower volume (both are exactly total_samples long)
+            if len(drums) == len(audio):
+                audio = audio + drums * 0.5
+            elif len(drums) > 0 and len(audio) > 0:
+                n = min(len(drums), len(audio))
+                mixed = np.zeros(max(len(drums), len(audio)), dtype=np.float64)
+                mixed[: len(audio)] += audio
+                mixed[: len(drums)] += drums * 0.5
+                audio = mixed
+
+        # Trim to the exact requested frame count
+        if len(audio) != total_samples:
+            if len(audio) > total_samples:
+                audio = audio[:total_samples]
+            else:
+                audio = np.pad(audio, (0, total_samples - len(audio)))
 
         # Global limiter
         max_val = np.max(np.abs(audio)) if len(audio) > 0 else 1.0

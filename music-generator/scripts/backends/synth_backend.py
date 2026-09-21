@@ -53,17 +53,22 @@ class SynthBackend(BaseBackend):
         seed: int | None = None,
     ) -> dict:
         """Generate audio using the deterministic synth engine."""
-        # Validate seed
+        # Validate seed — the API layer returns 400 for out-of-range seeds,
+        # so reaching here with an invalid seed is a programming error
         if seed is not None and (seed < 0 or seed > 2**32 - 1):
-            seed = 202  # Default fallback
+            raise ValueError(
+                f"Invalid seed: {seed}. Seed must be in range [0, {2**32 - 1}]."
+            )
 
         # Parse prompt for notes
         notes = self._parse_notes(prompt, key)
 
-        # Duration: length is in seconds, convert to bars
-        # At given BPM: 1 beat = 60/tempo seconds, 1 bar = 4 beats
+        # Duration: length is in seconds — passed through directly.
+        # The arrangement derives the exact frame count:
+        # int(length * sample_rate), rendering and trimming to match.
+        # Bars are only used for drum pattern scheduling.
         seconds_per_bar = 60.0 / tempo * 4.0
-        bars = max(1, int(length / seconds_per_bar))
+        bars = max(1, int(-(-length / seconds_per_bar)))  # ceil: cover the length
 
         # Get mood parameters
         mood_params = MOOD_MAP.get(mood, MOOD_MAP["happy"])
@@ -71,6 +76,7 @@ class SynthBackend(BaseBackend):
         config = SynthConfig(
             bpm=tempo,
             bars=bars,
+            length=float(length),
             seed=seed,
             sample_rate=48000,
             waveform=mood_params["waveform"],
@@ -79,7 +85,6 @@ class SynthBackend(BaseBackend):
             sustain_level=mood_params["sustain"],
             release_samples=mood_params["release"],
             filter_cutoff=mood_params["cutoff"],
-            filter_resonance=0.3,
         )
         engine = SynthEngine(config)
 

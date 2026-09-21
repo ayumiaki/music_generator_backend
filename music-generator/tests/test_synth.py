@@ -518,8 +518,8 @@ class TestFilterImpulseDecay:
     """Filter impulse response: decays at low resonance, no DC latch."""
 
     def test_impulse_decays_at_low_resonance(self):
-        from synth.filter import LadderFilter
-        flt = LadderFilter(sample_rate=48000, cutoff=1000, resonance=0.3)
+        from synth.filter import CascadeFilter
+        flt = CascadeFilter(sample_rate=48000, cutoff=1000)
         inp = np.zeros(24800)
         inp[0] = 1.0
         out = flt.render(inp)
@@ -529,8 +529,8 @@ class TestFilterImpulseDecay:
         assert np.all(np.isfinite(tail))
 
     def test_impulse_no_dc_latch_at_high_resonance(self):
-        from synth.filter import LadderFilter
-        flt = LadderFilter(sample_rate=48000, cutoff=1000, resonance=1.0)
+        from synth.filter import CascadeFilter
+        flt = CascadeFilter(sample_rate=48000, cutoff=1000)
         inp = np.zeros(24800)
         inp[0] = 1.0
         out = flt.render(inp)
@@ -547,8 +547,8 @@ class TestFilterAcceptanceGates:
 
     def test_impulse_decays_without_resets(self):
         """Impulse response decays without any safety resets."""
-        from synth.filter import LadderFilter
-        flt = LadderFilter(sample_rate=48000, cutoff=1000, resonance=0.3)
+        from synth.filter import CascadeFilter
+        flt = CascadeFilter(sample_rate=48000, cutoff=1000)
         inp = np.zeros(48000)
         inp[0] = 1.0
         out = flt.render(inp)
@@ -563,10 +563,10 @@ class TestFilterAcceptanceGates:
 
     def test_bounded_gain_across_cutoff_range(self):
         """Bounded gain across cutoff 20 Hz to 0.49fs."""
-        from synth.filter import LadderFilter
+        from synth.filter import CascadeFilter
         sample_rate = 48000
         for cutoff in [20, 100, 1000, 5000, 10000, 20000, 23500]:
-            flt = LadderFilter(sample_rate=sample_rate, cutoff=cutoff, resonance=0.3)
+            flt = CascadeFilter(sample_rate=sample_rate, cutoff=cutoff)
             # Render a sine wave at cutoff
             t = np.arange(48000) / sample_rate
             inp = np.sin(2 * np.pi * cutoff * t)
@@ -583,10 +583,10 @@ class TestFilterAcceptanceGates:
         Each stage has magnitude 2^(-1/8) at the requested composite cutoff,
         so the cascade hits -3dB at the requested frequency.
         """
-        from synth.filter import LadderFilter
+        from synth.filter import CascadeFilter
         sample_rate = 48000
         cutoff = 1000
-        flt = LadderFilter(sample_rate=sample_rate, cutoff=cutoff, resonance=0.0)
+        flt = CascadeFilter(sample_rate=sample_rate, cutoff=cutoff)
         # Measure frequency response using sine sweep (more reliable than FFT of white noise)
         freqs = np.linspace(20, 20000, 1000)
         mags = []
@@ -613,10 +613,10 @@ class TestFilterAcceptanceGates:
         response is monotonically decreasing. The peak should be at DC
         (0 Hz), not near the cutoff frequency.
         """
-        from synth.filter import LadderFilter
+        from synth.filter import CascadeFilter
         sample_rate = 48000
         cutoff = 1000
-        flt = LadderFilter(sample_rate=sample_rate, cutoff=cutoff, resonance=0.8)
+        flt = CascadeFilter(sample_rate=sample_rate, cutoff=cutoff)
         # Measure frequency response using sine sweep
         freqs = np.linspace(20, 20000, 1000)
         mags = []
@@ -636,9 +636,9 @@ class TestFilterAcceptanceGates:
 
     def test_fresh_filter_equals_reset_filter(self):
         """Fresh filter equals reset filter (deterministic state)."""
-        from synth.filter import LadderFilter
-        flt1 = LadderFilter(sample_rate=48000, cutoff=1000, resonance=0.3)
-        flt2 = LadderFilter(sample_rate=48000, cutoff=1000, resonance=0.3)
+        from synth.filter import CascadeFilter
+        flt1 = CascadeFilter(sample_rate=48000, cutoff=1000)
+        flt2 = CascadeFilter(sample_rate=48000, cutoff=1000)
         inp = np.sin(2 * np.pi * 440.0 * np.arange(48000) / 48000)
         out1 = flt1.render(inp)
         out2 = flt2.render(inp)
@@ -764,11 +764,11 @@ class TestEventOrdering:
         frequencies (state values hitting 1e14+). The one-pole cascade
         is unconditionally stable.
         """
-        from synth.filter import LadderFilter
+        from synth.filter import CascadeFilter
         sample_rate = 48000
         # Test at high cutoff frequencies that broke the TPT SVF
         for cutoff in [10000, 15000, 20000, 23000]:
-            flt = LadderFilter(sample_rate=sample_rate, cutoff=cutoff, resonance=0.0)
+            flt = CascadeFilter(sample_rate=sample_rate, cutoff=cutoff)
             rng = np.random.RandomState(42)
             inp = rng.randn(48000)
             out = flt.render(inp)
