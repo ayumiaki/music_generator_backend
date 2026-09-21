@@ -1,4 +1,9 @@
-"""Deterministic arrangement — sample-accurate sequencer with shared voice engine."""
+"""Deterministic arrangement — sample-accurate sequencer with shared voice engine.
+
+Duration is derived from requested seconds (exact frame counts), not bars.
+All events are rendered in a single pass through the voice engine so that
+overlapping notes genuinely coexist and polyphony is exercised correctly.
+"""
 from dataclasses import dataclass, field
 from typing import Optional
 import numpy as np
@@ -19,6 +24,7 @@ class ArrangementConfig:
     """Configuration for the arrangement sequencer."""
     bpm: float = 120.0
     bars: int = 1
+    length: float = 0.0  # Duration in seconds (overrides bars if > 0)
     polyphony: int = 8
     sample_rate: int = 48000
     wavetable_size: int = 4096
@@ -39,6 +45,9 @@ class Arrangement:
     No cumulative floating-point sleeps. Timing is calculated from
     beat positions and BPM directly to sample indices.
     Uses a shared VoiceEngine for proper polyphony and voice stealing.
+
+    Duration is derived from requested seconds (exact frame counts),
+    not bars. If length > 0, it overrides bars.
     """
 
     def __init__(self, config: Optional[ArrangementConfig] = None) -> None:
@@ -74,19 +83,26 @@ class Arrangement:
         return int(beats * beat_duration * self.config.sample_rate)
 
     def get_total_samples(self) -> int:
-        """Total duration in samples — fills the full bar count."""
-        if not self.events:
-            return 0
-        # Use bar count to determine total duration (not just last note)
+        """Total duration in samples — exact frame count from requested seconds.
+
+        If length > 0, use it directly (exact frame count).
+        Otherwise, fall back to bar count.
+        """
+        if self.config.length > 0:
+            # Exact frame count from requested seconds
+            return int(self.config.length * self.config.sample_rate)
+        # Fall back to bar count
         beats_per_bar = 4
         total_beats = self.config.bars * beats_per_bar
         return self.beat_to_samples(total_beats)
 
     def render(self) -> np.ndarray:
-        """Render the arrangement to a PCM buffer using shared voice engine."""
-        from .oscillator import WavetableOscillator
-        from .envelope import ADSREnvelope
-        from .filter import LadderFilter
+        """Render the arrangement to a PCM buffer using shared voice engine.
+
+        All events are rendered in a single pass through the voice engine
+        so that overlapping notes genuinely coexist and polyphony is
+        exercised correctly. Each event's waveform is respected.
+        """
         from .voice import VoiceEngine, VoiceConfig
 
         total_samples = self.get_total_samples()
@@ -114,30 +130,18 @@ class Arrangement:
             seed=self.config.seed,
         )
 
-        # Render each event through the shared engine
+        # Convert events to (freq, duration_samples, amplitude, waveform) tuples
+        # and render all at once through the shared engine
+        notes = []
         for event in self.events:
-            start_sample = self.beat_to_samples(event.time_beats)
             duration_samples = self.beat_to_samples(event.duration_beats)
-            end_sample = start_sample + duration_samples
+            if duration_samples > 0:
+                notes.append((event.freq, duration_samples, event.amplitude, event.waveform))
 
-            if end_sample > total_samples:
-                duration_samples = total_samples - start_sample
-                end_sample = total_samples
-
-            if duration_samples <= 0:
-                continue
-
-            # Render note through shared engine
-            note_audio = engine.render_block(
-                [(event.freq, duration_samples, event.amplitude)],
-                block_size=total_samples,
-            )
-
-            # Add to output at correct position
-            if len(note_audio) > 0:
-                out_end = min(start_sample + len(note_audio), total_samples)
-                copy_len = out_end - start_sample
-                output[start_sample:out_end] += note_audio[:copy_len]
+        if notes:
+            # Render all notes through the shared engine in a single block
+            rendered = engine.render_block(notes, block_size=total_samples)
+            output[:len(rendered)] = rendered[:total_samples]
 
         # Global limiter
         max_val = np.max(np.abs(output)) if len(output) > 0 else 1.0

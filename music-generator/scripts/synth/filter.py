@@ -1,4 +1,16 @@
-"""Stable 4-pole ladder filter — K3 SVF cascade with conservative damping.
+"""Stable 4-pole ladder filter — TPT/ZDF SVF cascade.
+
+Uses the complete TPT/ZDF recurrence:
+  g = tan(π*fc/fs) — warped frequency coefficient
+  k = 1/Q — damping (resonance)
+  v1 = (x - k*bp - lp) / (1 + g*(g+k)) — normalized solve
+  bp = bp + g*v1 — trapezoidal state update
+  lp = lp + g*bp — trapezoidal state update
+
+This is unconditionally stable for all cutoff frequencies because:
+- The denominator 1 + g*(g+k) is always positive
+- The state updates are implicit (trapezoidal)
+- No safety resets needed
 
 Self-oscillation at resonance=1.0 is a known limitation of discrete-time
 ladder filters. This implementation prioritizes stability: no NaN, no
@@ -9,7 +21,7 @@ from numpy.typing import NDArray
 
 
 class LadderFilter:
-    """4-pole lowpass ladder filter via cascaded K3 state-variable filters.
+    """4-pole lowpass ladder filter via cascaded TPT/ZDF SVF stages.
 
     Topology: two SVF stages in series. Unconditionally stable.
     - cutoff: 20–22050 Hz (for 48kHz sample rate)
@@ -46,10 +58,12 @@ class LadderFilter:
         if len(input_signal) == 0:
             return input_signal.copy()
 
-        f = 2.0 * np.sin(np.pi * self.cutoff / self.sample_rate)
-        # Conservative damping: k = 1 - resonance * 0.5
-        # At resonance=1.0, k=0.5 (high Q but stable)
-        k = 1.0 - self.resonance * 0.5
+        # TPT/ZDF coefficients
+        g = np.tan(np.pi * self.cutoff / self.sample_rate)
+        # k = 1/Q; resonance maps to Q = 1/(1-resonance*0.9)
+        # At resonance=0, Q=1 (no peak); at resonance=1, Q=10 (high peak)
+        q = 1.0 / (1.0 - self.resonance * 0.9 + 1e-10)
+        k = 1.0 / q
 
         bp1 = self._bp1
         lp1 = self._lp1
@@ -61,17 +75,15 @@ class LadderFilter:
         for i in range(len(input_signal)):
             x = float(input_signal[i])
 
-            # Stage 1 SVF
-            bp1 = bp1 + f * (x - k * bp1 - lp1)
-            lp1 = lp1 + f * bp1
+            # Stage 1 SVF — complete TPT/ZDF recurrence
+            v1 = (x - k * bp1 - lp1) / (1.0 + g * (g + k))
+            bp1 = bp1 + g * v1
+            lp1 = lp1 + g * bp1
 
-            # Stage 2 SVF
-            bp2 = bp2 + f * (lp1 - k * bp2 - lp2)
-            lp2 = lp2 + f * bp2
-
-            # Safety reset if state is growing too fast (prevents NaN at extreme cutoff)
-            if abs(bp1) > 100.0 or abs(lp1) > 100.0 or abs(bp2) > 100.0 or abs(lp2) > 100.0:
-                bp1 = lp1 = bp2 = lp2 = 0.0
+            # Stage 2 SVF — complete TPT/ZDF recurrence
+            v2 = (lp1 - k * bp2 - lp2) / (1.0 + g * (g + k))
+            bp2 = bp2 + g * v2
+            lp2 = lp2 + g * bp2
 
             out[i] = lp2
 

@@ -27,6 +27,7 @@ class SynthConfig:
     polyphony: int = 8
     bpm: float = 120.0
     bars: int = 1
+    length: float = 0.0  # Duration in seconds (overrides bars if > 0)
     wavetable_size: int = 4096
     waveform: str = "saw"
     attack_samples: int = 4800
@@ -46,18 +47,26 @@ class SynthEngine:
 
     Produces actual PCM audio from note events — no API-shaped cardboard scenery.
     Identical input + seed → byte-identical PCM output.
+
+    Seed validation: invalid seeds (negative or > 2^32-1) raise ValueError.
+    The API layer should catch this and return a 400 response.
     """
 
     def __init__(self, config: Optional[SynthConfig] = None) -> None:
         self.config = config or SynthConfig()
-        # Validate seed
+        # Validate seed — raise ValueError for invalid range
+        # (API layer should catch this and return 400)
         if self.config.seed is not None and (self.config.seed < 0 or self.config.seed > 2**32 - 1):
-            self.config.seed = 202
+            raise ValueError(
+                f"Invalid seed: {self.config.seed}. "
+                f"Seed must be in range [0, {2**32 - 1}]."
+            )
         self._rng = np.random.RandomState(self.config.seed)
         self._arrangement = Arrangement(
             ArrangementConfig(
                 bpm=self.config.bpm,
                 bars=self.config.bars,
+                length=self.config.length,
                 polyphony=self.config.polyphony,
                 sample_rate=self.config.sample_rate,
                 wavetable_size=self.config.wavetable_size,
@@ -90,9 +99,11 @@ class SynthEngine:
         freq: float,
         duration_beats: float = 0.25,
         amplitude: float = 1.0,
-        waveform: str = "saw",
+        waveform: str | None = None,
     ) -> None:
-        """Add a note to the arrangement."""
+        """Add a note to the arrangement. If waveform is None, uses config waveform."""
+        if waveform is None:
+            waveform = self.config.waveform
         self._arrangement.add_note(
             time_beats=time_beats,
             freq=freq,
